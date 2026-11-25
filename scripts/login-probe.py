@@ -83,7 +83,29 @@ def main():
         sys.exit(1)
     if any(x.endswith(':id/txt_accelerate') for x in ids) and any(x.endswith(':id/txt_user') for x in ids):
         print('LOGIN_STATUS=APP_ACCOUNT_SCREEN')
-        return
+        user_label = node_by_id(ui, 'txt_user').get('text', '')
+        if not user_label or '尚未登陆' in user_label or '尚未登录' in user_label:
+            print('LOGIN_STATUS=ACCOUNT_NOT_AUTHENTICATED')
+            sys.exit(1)
+        print('CHECKIN_ACTION=CLICK_ONCE')
+        node_tap(node_by_id(ui, 'txt_accelerate'))
+        time.sleep(8)
+        check_ui = read_ui()
+        check_texts = [n.get('text', '') for n in check_ui.iter()]
+        success_markers = ['签到成功', '今日已签到', '已经签到', '已签到', '签到完成']
+        if any(marker in text for marker in success_markers for text in check_texts):
+            print('CHECKIN_STATUS=SUCCESS')
+            return
+        # Toasts are not always present in the accessibility tree; inspect logs in memory only.
+        log = adb('logcat', '-d', '-t', '250', capture=True).decode('utf-8', errors='ignore')
+        if any(marker in log for marker in success_markers):
+            print('CHECKIN_STATUS=SUCCESS')
+            return
+        if any('尚未登陆' in text or '尚未登录' in text for text in check_texts):
+            print('CHECKIN_STATUS=FAILED_AUTH_REQUIRED')
+        else:
+            print('CHECKIN_STATUS=NOT_CONFIRMED')
+        sys.exit(1)
     print('LOGIN_STATUS=NOT_CONFIRMED (unexpected screen)')
     for marker in ['验证码', '登录失败', '登录成功', '安全验证', '验证身份']:
         if any(marker in t for t in texts):
