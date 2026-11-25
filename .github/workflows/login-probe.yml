@@ -1,6 +1,15 @@
 name: One-time Android login probe
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: Check existing status without clicking, or perform one check-in click
+        required: true
+        default: verify
+        type: choice
+        options:
+          - verify
+          - click
 permissions:
   contents: read
 jobs:
@@ -35,6 +44,7 @@ jobs:
         env:
           NCAT_USERNAME: ${{ secrets.NCAT_USERNAME }}
           NCAT_PASSWORD: ${{ secrets.NCAT_PASSWORD }}
+          CHECKIN_ACTION: ${{ inputs.action }}
         run: python3 scripts/login-probe.py
       - name: Delete disposable Android container
         if: always()
