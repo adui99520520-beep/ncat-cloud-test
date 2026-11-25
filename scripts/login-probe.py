@@ -87,22 +87,39 @@ def main():
         if not user_label or '尚未登陆' in user_label or '尚未登录' in user_label:
             print('LOGIN_STATUS=ACCOUNT_NOT_AUTHENTICATED')
             sys.exit(1)
+        action = os.environ.get('CHECKIN_ACTION', 'verify')
+        success_markers = ['签到成功', '今日已签到', '已经签到', '已签到', '签到完成']
+        button_text = node_by_id(ui, 'txt_accelerate').get('text', '')
+        if any(marker in text for marker in success_markers for text in texts) or any(marker in button_text for marker in success_markers):
+            print('CHECKIN_STATUS=SUCCESS_ALREADY_RECORDED')
+            return
+        if action == 'verify':
+            if button_text == '今日签到':
+                print('CHECKIN_STATUS=STILL_AVAILABLE')
+            else:
+                print('CHECKIN_STATUS=UNKNOWN_READ_ONLY')
+            return
+        if action != 'click':
+            raise RuntimeError('Unsupported CHECKIN_ACTION')
         print('CHECKIN_ACTION=CLICK_ONCE')
         node_tap(node_by_id(ui, 'txt_accelerate'))
-        time.sleep(8)
-        check_ui = read_ui()
-        check_texts = [n.get('text', '') for n in check_ui.iter()]
-        success_markers = ['签到成功', '今日已签到', '已经签到', '已签到', '签到完成']
-        if any(marker in text for marker in success_markers for text in check_texts):
-            print('CHECKIN_STATUS=SUCCESS')
-            return
-        # Toasts are not always present in the accessibility tree; inspect logs in memory only.
-        log = adb('logcat', '-d', '-t', '250', capture=True).decode('utf-8', errors='ignore')
-        if any(marker in log for marker in success_markers):
-            print('CHECKIN_STATUS=SUCCESS')
-            return
+        for _ in range(20):
+            time.sleep(1)
+            check_ui = read_ui()
+            check_texts = [n.get('text', '') for n in check_ui.iter()]
+            check_button = node_by_id(check_ui, 'txt_accelerate').get('text', '')
+            if any(marker in text for marker in success_markers for text in check_texts) or any(marker in check_button for marker in success_markers):
+                print('CHECKIN_STATUS=SUCCESS')
+                return
+            # Toasts are not always present in the accessibility tree; inspect logs in memory only.
+            log = adb('logcat', '-d', '-t', '250', capture=True).decode('utf-8', errors='ignore')
+            if any(marker in log for marker in success_markers):
+                print('CHECKIN_STATUS=SUCCESS')
+                return
         if any('尚未登陆' in text or '尚未登录' in text for text in check_texts):
             print('CHECKIN_STATUS=FAILED_AUTH_REQUIRED')
+        elif check_button == '今日签到':
+            print('CHECKIN_STATUS=NOT_CONFIRMED_BUTTON_UNCHANGED')
         else:
             print('CHECKIN_STATUS=NOT_CONFIRMED')
         sys.exit(1)
