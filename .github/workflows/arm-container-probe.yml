@@ -49,17 +49,6 @@ jobs:
             adb -s 127.0.0.1:5555 shell uiautomator dump /sdcard/window-my.xml >/dev/null 2>&1 || true
             adb -s 127.0.0.1:5555 shell cat /sdcard/window-my.xml >/tmp/ui-my.xml 2>/dev/null || true
             python3 -c 'import xml.etree.ElementTree as ET; [print("text=%r desc=%r id=%r clickable=%s bounds=%s" % (n.attrib.get("text"), n.attrib.get("content-desc"), n.attrib.get("resource-id"), n.attrib.get("clickable"), n.attrib.get("bounds"))) for n in ET.parse("/tmp/ui-my.xml").getroot().iter() if n.attrib.get("text") or n.attrib.get("content-desc")]'
-            if grep -q '今日签到' /tmp/ui-my.xml; then
-              echo '=== One-time check-in button test on disposable guest device ==='
-              adb -s 127.0.0.1:5555 shell input tap 125 131
-              sleep 4
-              adb -s 127.0.0.1:5555 shell uiautomator dump /sdcard/window-after-checkin.xml >/dev/null 2>&1 || true
-              adb -s 127.0.0.1:5555 shell cat /sdcard/window-after-checkin.xml >/tmp/ui-after-checkin.xml 2>/dev/null || true
-              python3 -c 'import xml.etree.ElementTree as ET; [print("text=%r desc=%r id=%r clickable=%s bounds=%s" % (n.attrib.get("text"), n.attrib.get("content-desc"), n.attrib.get("resource-id"), n.attrib.get("clickable"), n.attrib.get("bounds"))) for n in ET.parse("/tmp/ui-after-checkin.xml").getroot().iter() if n.attrib.get("text") or n.attrib.get("content-desc")]'
-              adb -s 127.0.0.1:5555 logcat -d -t 120 | grep -E '签到|check.?in|Check.?in|登录|Toast' | tail -20 || true
-            else
-              echo CHECKIN_BUTTON_NOT_FOUND
-            fi
             for word in 今日签到 签到 我的 登录; do
               if grep -q "$word" /tmp/ui.xml; then echo "UI_PRESENT=$word"; else echo "UI_ABSENT=$word"; fi
             done
