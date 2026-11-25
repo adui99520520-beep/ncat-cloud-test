@@ -34,10 +34,15 @@ jobs:
           echo '1de44b3d42f60120d46e621968239c869995c659f2baf6bfb83b3d60539b28a3  /tmp/ncat.apk' | sha256sum -c -
           adb -s 127.0.0.1:5555 install /tmp/ncat.apk
           adb -s 127.0.0.1:5555 logcat -c
-          adb -s 127.0.0.1:5555 shell monkey -p com.ncatC200000V261126.T030029 -c android.intent.category.LAUNCHER 1 >/dev/null
+          adb -s 127.0.0.1:5555 shell am start -n com.ncatC200000V261126.T030029/com.salmon.film.main.ui.SplashActivity
           sleep 30
           if adb -s 127.0.0.1:5555 shell pidof com.ncatC200000V261126.T030029 | grep -q '[0-9]'; then
             echo APP_PROCESS=RUNNING
+            adb -s 127.0.0.1:5555 shell uiautomator dump /sdcard/window.xml >/dev/null 2>&1 || true
+            adb -s 127.0.0.1:5555 shell cat /sdcard/window.xml >/tmp/ui.xml 2>/dev/null || true
+            for word in 今日签到 签到 我的 登录; do
+              if grep -q "$word" /tmp/ui.xml; then echo "UI_PRESENT=$word"; else echo "UI_ABSENT=$word"; fi
+            done
           else
             echo APP_PROCESS=NOT_RUNNING
             adb -s 127.0.0.1:5555 logcat -d -b crash | grep -E 'FATAL EXCEPTION|Process:|java.lang.|UnsatisfiedLinkError|Fatal signal|Caused by:' | head -25 || true
