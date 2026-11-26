@@ -1,0 +1,66 @@
+name: One-time check-in with encrypted evidence
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check-in:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up disposable Android
+        run: |
+          mkdir -p checkin-evidence
+          if ! sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"; then
+            sudo apt-get update -qq
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+            sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y adb
+          docker run -d --rm --privileged --name ncat-controlled -p 127.0.0.1:5555:5555 redroid/redroid@sha256:52332b2d74f337982d5ac281a8020ec297fb1ea05cbdcdaaa9c19a2065ae1adc androidboot.use_memfd=1 androidboot.redroid_gpu_mode=guest
+          for n in $(seq 1 90); do
+            adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true
+            if [ "$(adb -s 127.0.0.1:5555 shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ]; then break; fi
+            sleep 3
+          done
+          test "$(adb -s 127.0.0.1:5555 shell getprop sys.boot_completed | tr -d '\r')" = 1
+          adb -s 127.0.0.1:5555 shell setprop persist.sys.timezone Asia/Kuala_Lumpur
+          curl -fL --retry 2 --max-time 120 -sS -o /tmp/ncat.apk 'https://dl.ncat33.com/target/apk/ncat/202611/26/app/c200000-NcatC200000V261126030029-3.5.1.30501_release.apk'
+          echo '1de44b3d42f60120d46e621968239c869995c659f2baf6bfb83b3d60539b28a3  /tmp/ncat.apk' | sha256sum -c -
+          adb -s 127.0.0.1:5555 install /tmp/ncat.apk
+      - name: Attempt at most one controlled check-in
+        env:
+          NCAT_USERNAME: ${{ secrets.NCAT_USERNAME }}
+          NCAT_PASSWORD: ${{ secrets.NCAT_PASSWORD }}
+          EVIDENCE_DIR: checkin-evidence
+        run: |
+          set +e
+          python3 scripts/checkin-evidence.py 2>&1 | tee checkin-evidence/run.log
+          result=${PIPESTATUS[0]}
+          exit "$result"
+      - name: Encrypt evidence before upload
+        if: always()
+        run: |
+          set -euo pipefail
+          trap 'rm -rf checkin-evidence "$RUNNER_TEMP/evidence-password"' EXIT
+          if [ -d checkin-evidence ] && [ -n "$(ls -A checkin-evidence)" ]; then
+            mkdir -p "$RUNNER_TEMP/encrypted-evidence"
+            openssl rand -hex 32 > "$RUNNER_TEMP/evidence-password"
+            tar -czf - checkin-evidence | openssl enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -pass file:"$RUNNER_TEMP/evidence-password" -out "$RUNNER_TEMP/encrypted-evidence/evidence.tar.gz.enc"
+            openssl pkeyutl -encrypt -pubin -inkey scripts/evidence-public.pem -in "$RUNNER_TEMP/evidence-password" -out "$RUNNER_TEMP/encrypted-evidence/password.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+          fi
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce # v4.4.3
+        with:
+          name: encrypted-checkin-evidence
+          path: ${{ runner.temp }}/encrypted-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Delete disposable Android container
+        if: always()
+        run: docker rm -f ncat-controlled >/dev/null 2>&1 || true
