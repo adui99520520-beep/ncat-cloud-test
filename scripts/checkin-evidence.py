@@ -176,11 +176,12 @@ def main():
             ui = p.read_ui()
             record_countdown(ui, entry_time, seen_countdowns)
             continue
-        # Accept only one explicit, enabled “点击签到” control in the expected upper-right area.
+        # Android UI dumps can omit visible-to-user; validate the exact header control,
+        # including its app resource ID and tight bounds outside the ad content.
         for n in ui.iter():
-            if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'false') == 'true':
+            if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('resource-id', '').endswith(':id/txt_time') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'true') == 'true':
                 c = list(map(int, re.findall(r'\d+', n.get('bounds', ''))))
-                if len(c) == 4 and c[2] > c[0] and c[3] > c[1] and (c[0]+c[2])//2 >= 360 and (c[1]+c[3])//2 <= 425:
+                if len(c) == 4 and c[2] > c[0] and c[3] > c[1] and c[0] >= 540 and c[2] <= 720 and c[1] >= 30 and c[3] <= 132:
                     unique[tuple(c)] = n
         if len(unique) > 1:
             evidence('03-final', ui)
@@ -205,7 +206,7 @@ def main():
         return 1
     candidates = []
     for n in ui.iter():
-        if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'false') == 'true':
+        if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('resource-id', '').endswith(':id/txt_time') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'true') == 'true':
             c = tuple(map(int, re.findall(r'\d+', n.get('bounds', ''))))
             if len(c) == 4 and c == expected_bounds:
                 candidates.append(n)
