@@ -103,26 +103,42 @@ def main():
             raise RuntimeError('Unsupported CHECKIN_ACTION')
         print('CHECKIN_ACTION=CLICK_ONCE')
         node_tap(node_by_id(ui, 'txt_accelerate'))
+        check_texts = []
+        check_ids = []
+        check_button = ''
         for _ in range(20):
             time.sleep(1)
             check_ui = read_ui()
             check_texts = [n.get('text', '') for n in check_ui.iter()]
-            check_button = node_by_id(check_ui, 'txt_accelerate').get('text', '')
+            check_ids = [n.get('resource-id', '') for n in check_ui.iter()]
+            check_button = next((n.get('text', '') for n in check_ui.iter() if n.get('resource-id', '').endswith(':id/txt_accelerate')), '')
             if any(marker in text for marker in success_markers for text in check_texts) or any(marker in check_button for marker in success_markers):
                 print('CHECKIN_STATUS=SUCCESS')
                 return
+            if 'txt_accelerate' not in '\n'.join(check_ids):
+                break
             # Toasts are not always present in the accessibility tree; inspect logs in memory only.
             log = adb('logcat', '-d', '-t', '250', capture=True).decode('utf-8', errors='ignore')
             if any(marker in log for marker in success_markers):
                 print('CHECKIN_STATUS=SUCCESS')
                 return
-        if any('尚未登陆' in text or '尚未登录' in text for text in check_texts):
+        if any(x.endswith(':id/txt_pwd') for x in check_ids):
+            print('CHECKIN_STATUS=LOGIN_PROMPT')
+        elif any('尚未登陆' in text or '尚未登录' in text for text in check_texts):
             print('CHECKIN_STATUS=FAILED_AUTH_REQUIRED')
+        elif any('验证码' in text for text in check_texts):
+            print('CHECKIN_STATUS=CAPTCHA_PROMPT')
+        elif any('网络' in text for text in check_texts):
+            print('CHECKIN_STATUS=NETWORK_PROMPT')
+        elif any(('确认' in text or '确定' in text) and '签到' in ''.join(check_texts) for text in check_texts):
+            print('CHECKIN_STATUS=CONFIRMATION_PROMPT')
+        elif any(x.endswith(':id/txt_accelerate') for x in check_ids) and check_button == '今日签到':
+            print('CHECKIN_STATUS=NOT_CONFIRMED_BUTTON_UNCHANGED')
         elif check_button == '今日签到':
             print('CHECKIN_STATUS=NOT_CONFIRMED_BUTTON_UNCHANGED')
         else:
-            print('CHECKIN_STATUS=NOT_CONFIRMED')
-        sys.exit(1)
+            print('CHECKIN_STATUS=UNKNOWN_POST_CLICK_SCREEN')
+        return
     print('LOGIN_STATUS=NOT_CONFIRMED (unexpected screen)')
     for marker in ['验证码', '登录失败', '登录成功', '安全验证', '验证身份']:
         if any(marker in t for t in texts):
