@@ -19,13 +19,20 @@ spec.loader.exec_module(p)
 
 EXPECTED_USER = 'adui99520520@bot.cue.im'
 ALLOWED_SERVERS = ('精品1', '精品2', '精品3', '优化1', '精品5')
+APP_UI_READY_TIMEOUT = 90
+APP_UI_POLL_INTERVAL = 2
+APP_UI_COMMAND_TIMEOUT = 5
 # Prefer the last known working line, but start with the app's current line and
 # visit every other supported line at most once.
 PREFERRED_SERVERS = ('精品3', '精品1', '精品2', '优化1', '精品5')
 USERNAME = ''
 PASSWORD = ''
 AUTHENTICATED = False
+EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = False
+LOGIN_USERNAME_VERIFIED_THIS_RUN = False
+INITIAL_STATUS_AVAILABLE = False
 ATTEMPTED_SERVERS = set()
+IDENTITY_BLOCKED = False
 
 
 def scrub(value):
@@ -126,14 +133,50 @@ def account_screen(root):
     return any(value.endswith(':id/txt_accelerate') for value in ids) and any(value.endswith(':id/txt_user') for value in ids)
 
 
+def account_identity_status(root):
+    if not account_screen(root):
+        return 'NOT_ACCOUNT_SCREEN'
+    expected = EXPECTED_USER.casefold()
+    values = [
+        value.strip()
+        for node in root.iter()
+        for value in (node.get('text', ''), node.get('content-desc', ''))
+        if value.strip()
+    ]
+    emails = [email.casefold() for value in values for email in re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', value)]
+    if any(email != expected for email in emails):
+        return 'OTHER_ACCOUNT'
+    if expected in emails:
+        return 'EXPECTED_ACCOUNT'
+    return 'UNVERIFIED'
+
+
+def visible_other_email(root):
+    expected = EXPECTED_USER.casefold()
+    return any(
+        email.casefold() != expected
+        for value in texts(root)
+        for email in re.findall(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', value)
+    )
+
+
+def block_on_other_email(root):
+    global IDENTITY_BLOCKED
+    if visible_other_email(root):
+        IDENTITY_BLOCKED = True
+        return True
+    return False
+
+
 def authenticated_account_screen(root):
     if not account_screen(root):
         return False
-    try:
-        label = p.node_by_id(root, 'txt_user').get('text', '').strip()
-    except Exception:
+    identity = account_identity_status(root)
+    if identity == 'OTHER_ACCOUNT':
         return False
-    return bool(label) and '尚未登陆' not in label and '尚未登录' not in label
+    if identity == 'EXPECTED_ACCOUNT':
+        return True
+    return EXPECTED_ACCOUNT_VERIFIED_THIS_RUN
 
 
 def account_status(root):
@@ -150,6 +193,55 @@ def account_status(root):
     if '已签到' in button:
         return 'SIGNED_IN'
     return 'UNKNOWN'
+
+
+def classify_account_ui(root):
+    if root is None:
+        return 'UNKNOWN'
+    state = p.account_state(root)
+    if state == 'AUTHENTICATED':
+        identity = account_identity_status(root)
+        if identity == 'EXPECTED_ACCOUNT':
+            return 'AUTHENTICATED_EXPECTED'
+        if identity == 'OTHER_ACCOUNT':
+            return 'AUTHENTICATED_OTHER_ACCOUNT'
+        if EXPECTED_ACCOUNT_VERIFIED_THIS_RUN and account_screen(root):
+            return 'AUTHENTICATED_EXPECTED'
+        return 'AUTHENTICATED_IDENTITY_UNVERIFIED'
+    if visible_other_email(root):
+        return 'OTHER_EMAIL_VISIBLE'
+    return state
+
+
+def wait_for_account_ui(timeout=APP_UI_READY_TIMEOUT):
+    """Wait only a bounded time for an unambiguous account or login UI."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    last_error_class = ''
+    attempted_my_navigation = False
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        call_timeout = max(0.1, min(APP_UI_COMMAND_TIMEOUT, remaining / 2))
+        try:
+            ui = p.read_ui(timeout=call_timeout)
+            state = classify_account_ui(ui)
+            if state != 'UNKNOWN':
+                return ui, state
+            if not attempted_my_navigation:
+                my_tabs = p.exact_text_nodes(ui, '我的')
+                if len(my_tabs) == 1:
+                    attempted_my_navigation = True
+                    p.node_tap(my_tabs[0])
+        except Exception as exc:
+            last_error_class = type(exc).__name__
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(APP_UI_POLL_INTERVAL, remaining))
+    print('APP_UI_WAIT=TIMEOUT', flush=True)
+    if last_error_class:
+        print('APP_UI_LAST_ERROR_CLASS=' + last_error_class, flush=True)
+    return None, 'UNKNOWN'
 
 
 def exact_text_nodes(root, value):
@@ -199,24 +291,14 @@ def evidence(label, root=None):
 
 def read_authenticated_account_screen():
     """Return to the user's account tab without touching any ad or check-in control."""
+    global IDENTITY_BLOCKED
     for _ in range(3):
-        try:
-            ui = p.read_ui()
-        except Exception:
-            ui = None
-        if ui is not None and authenticated_account_screen(ui):
+        ui, state = wait_for_account_ui(timeout=30)
+        if state == 'AUTHENTICATED_EXPECTED' and authenticated_account_screen(ui):
             return ui
-        if ui is not None:
-            my_tabs = exact_text_nodes(ui, '我的')
-            if len(my_tabs) == 1:
-                try:
-                    p.node_tap(my_tabs[0])
-                    time.sleep(2)
-                    ui = p.read_ui()
-                    if authenticated_account_screen(ui):
-                        return ui
-                except Exception:
-                    pass
+        if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'AUTHENTICATED_IDENTITY_UNVERIFIED', 'OTHER_EMAIL_VISIBLE', 'LOGIN_FORM', 'LOGGED_OUT', 'AMBIGUOUS_LOGIN_FORM'):
+            IDENTITY_BLOCKED = True
+            return None
         try:
             p.adb('shell', 'input', 'keyevent', '4')
             time.sleep(1.5)
@@ -234,6 +316,9 @@ def open_settings_from_account():
     time.sleep(1.5)
     try:
         settings = p.read_ui()
+        if block_on_other_email(settings):
+            print('ACCOUNT_IDENTITY=STOP_OTHER_EMAIL_VISIBLE', flush=True)
+            return None
         line = p.node_by_id(settings, 'txt_line')
         if line.get('text', '').strip() not in ALLOWED_SERVERS:
             return None
@@ -281,6 +366,9 @@ def switch_server(target):
         except Exception:
             print('LINE_SWITCH=STOP_PICKER_NOT_READABLE', flush=True)
             return 'STOP', None
+        if block_on_other_email(picker):
+            print('ACCOUNT_IDENTITY=STOP_OTHER_EMAIL_VISIBLE', flush=True)
+            return 'STOP', None
         if '选择应用服务器' not in texts(picker):
             error = network_io_error(picker)
             print('LINE_SWITCH=' + ('NETWORK_IO' if error else 'STOP_PICKER_NOT_VERIFIED'), flush=True)
@@ -298,6 +386,9 @@ def switch_server(target):
                 p.adb('shell', 'input', 'swipe', '360', '1110', '360', '720', '450')
                 time.sleep(0.5)
                 picker = p.read_ui()
+                if block_on_other_email(picker):
+                    print('ACCOUNT_IDENTITY=STOP_OTHER_EMAIL_VISIBLE', flush=True)
+                    return 'STOP', None
                 options = exact_text_nodes(picker, target)
             except Exception:
                 options = []
@@ -317,6 +408,9 @@ def switch_server(target):
         time.sleep(1.5)
         try:
             settings = p.read_ui()
+            if block_on_other_email(settings):
+                print('ACCOUNT_IDENTITY=STOP_OTHER_EMAIL_VISIBLE', flush=True)
+                return 'STOP', None
             chosen = p.node_by_id(settings, 'txt_line').get('text', '').strip()
         except Exception:
             print('LINE_SWITCH=STOP_SELECTED_LINE_UNREADABLE', flush=True)
@@ -372,6 +466,9 @@ def find_confirm_target(root):
 
 
 def retry_decision_after_network_error(server, ui=None, image_path=None):
+    if IDENTITY_BLOCKED:
+        print('RESULT=STOP_ACCOUNT_IDENTITY_BLOCKED_NO_ROUTE_RETRY', flush=True)
+        return 1
     if not network_io_error(ui, image_path):
         return None
     print('NETWORK_IO_ERROR_DETECTED=YES', flush=True)
@@ -389,6 +486,12 @@ def retry_decision_after_network_error(server, ui=None, image_path=None):
 
 def attempt_on_server(server, initial_ui):
     """Try one line once; return RETRY only for a detected network-I/O exception."""
+    if not AUTHENTICATED or not authenticated_account_screen(initial_ui):
+        print('RESULT=STOP_EXPECTED_ACCOUNT_NOT_VERIFIED_NO_CLICK', flush=True)
+        return 1
+    if not INITIAL_STATUS_AVAILABLE:
+        print('RESULT=STOP_INITIAL_TODAY_STATUS_NOT_VERIFIED_NO_CLICK', flush=True)
+        return 1
     status = account_status(initial_ui)
     if status == 'SIGNED_IN':
         print('RESULT=ALREADY_CHECKED_IN', flush=True)
@@ -414,6 +517,9 @@ def attempt_on_server(server, initial_ui):
     seen_countdowns = set()
     time.sleep(0.5)
     ui = p.read_ui()
+    if block_on_other_email(ui):
+        print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_FURTHER_TAPS', flush=True)
+        return 1
     image_path = evidence('02-after-entry-' + server, ui)
     record_countdown(ui, entry_time, seen_countdowns)
     if success(ui):
@@ -432,6 +538,9 @@ def attempt_on_server(server, initial_ui):
     while time.monotonic() < countdown_deadline:
         time.sleep(min(1.0, max(0.05, countdown_deadline - time.monotonic())))
         ui = p.read_ui()
+        if block_on_other_email(ui):
+            print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_FURTHER_TAPS', flush=True)
+            return 1
         record_countdown(ui, entry_time, seen_countdowns)
         if success(ui):
             status = persistent_status_after_attempt(server)[0]
@@ -446,6 +555,9 @@ def attempt_on_server(server, initial_ui):
 
     unique = {}
     for _ in range(45):
+        if block_on_other_email(ui):
+            print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_FURTHER_TAPS', flush=True)
+            return 1
         record_countdown(ui, entry_time, seen_countdowns)
         if success(ui):
             status = persistent_status_after_attempt(server)[0]
@@ -460,6 +572,9 @@ def attempt_on_server(server, initial_ui):
         if countdown_values(ui):
             time.sleep(1)
             ui = p.read_ui()
+            if block_on_other_email(ui):
+                print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_FURTHER_TAPS', flush=True)
+                return 1
             record_countdown(ui, entry_time, seen_countdowns)
             continue
         unique = find_confirm_target(ui)
@@ -471,6 +586,9 @@ def attempt_on_server(server, initial_ui):
             break
         time.sleep(1)
         ui = p.read_ui()
+        if block_on_other_email(ui):
+            print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_FURTHER_TAPS', flush=True)
+            return 1
 
     if len(unique) != 1:
         image_path = evidence('03-final-' + server, ui)
@@ -488,9 +606,15 @@ def attempt_on_server(server, initial_ui):
         record_countdown(ui, entry_time, seen_countdowns)
         print('RESULT=STOP_COUNTDOWN_REAPPEARED_NO_CONFIRM_TAP', flush=True)
         return 1
+    if block_on_other_email(ui):
+        print('RESULT=STOP_OTHER_EMAIL_VISIBLE_NO_CONFIRM_TAP', flush=True)
+        return 1
     candidates = find_confirm_target(ui)
     if len(candidates) != 1 or next(iter(candidates.keys())) != expected_bounds:
         print('RESULT=STOP_CONFIRM_TARGET_CHANGED_NO_CONFIRM_TAP', flush=True)
+        return 1
+    if not AUTHENTICATED or not INITIAL_STATUS_AVAILABLE:
+        print('RESULT=STOP_ACCOUNT_OR_INITIAL_STATUS_NOT_VERIFIED_NO_CONFIRM_TAP', flush=True)
         return 1
     print('COUNTDOWN_WAITED_CONFIRM_TARGET=EXACT_TOP_RIGHT', flush=True)
     p.node_tap(next(iter(candidates.values())))
@@ -541,8 +665,97 @@ def attempt_on_server(server, initial_ui):
     return 1
 
 
+def login_expected_account(ui, state):
+    """Sign in only from a uniquely recognized login form using the fixed bot account."""
+    global EXPECTED_ACCOUNT_VERIFIED_THIS_RUN, LOGIN_USERNAME_VERIFIED_THIS_RUN
+    if state == 'LOGGED_OUT':
+        user_nodes = p.nodes_by_id(ui, 'txt_user')
+        if len(user_nodes) != 1:
+            print('RESULT=STOP_GUEST_LOGIN_ENTRY_NOT_UNIQUE', flush=True)
+            return None, 'UNKNOWN'
+        p.node_tap(user_nodes[0])
+        ui, state = wait_for_account_ui()
+    if state != 'LOGIN_FORM':
+        print('RESULT=STOP_LOGIN_FORM_NOT_VERIFIED', flush=True)
+        return None, state
+
+    account_nodes = p.nodes_by_id(ui, 'txt_account')
+    password_nodes = p.nodes_by_id(ui, 'txt_pwd')
+    if len(account_nodes) != 1 or len(password_nodes) != 1:
+        print('RESULT=STOP_LOGIN_FIELDS_NOT_UNIQUE', flush=True)
+        return None, 'UNKNOWN'
+    account_field = account_nodes[0]
+    current_account = account_field.get('text', '').strip()
+    if current_account:
+        print('RESULT=STOP_USERNAME_FIELD_NOT_EMPTY_BEFORE_INPUT', flush=True)
+        return None, 'UNKNOWN'
+    p.node_tap(account_field)
+    p.send_text(USERNAME)
+    ui = p.read_ui(timeout=APP_UI_COMMAND_TIMEOUT)
+    if classify_account_ui(ui) != 'LOGIN_FORM':
+        print('RESULT=STOP_LOGIN_FORM_CHANGED_BEFORE_SUBMIT', flush=True)
+        return None, 'UNKNOWN'
+    account_nodes = p.nodes_by_id(ui, 'txt_account')
+    if len(account_nodes) != 1 or account_nodes[0].get('text', '').strip() != EXPECTED_USER:
+        print('RESULT=STOP_USERNAME_INPUT_NOT_CONFIRMED', flush=True)
+        return None, 'UNKNOWN'
+    LOGIN_USERNAME_VERIFIED_THIS_RUN = True
+    password_nodes = p.nodes_by_id(ui, 'txt_pwd')
+    if len(password_nodes) != 1:
+        print('RESULT=STOP_PASSWORD_FIELD_NOT_UNIQUE', flush=True)
+        return None, 'UNKNOWN'
+    if password_nodes[0].get('text', '').strip():
+        print('RESULT=STOP_PASSWORD_FIELD_NOT_EMPTY', flush=True)
+        return None, 'UNKNOWN'
+
+    p.node_tap(password_nodes[0])
+    p.send_text(PASSWORD)
+    p.adb('shell', 'input', 'keyevent', '4')
+    ui = p.read_ui(timeout=APP_UI_COMMAND_TIMEOUT)
+    if classify_account_ui(ui) != 'LOGIN_FORM':
+        print('RESULT=STOP_LOGIN_FORM_CHANGED_BEFORE_SUBMIT', flush=True)
+        return None, 'UNKNOWN'
+    account_nodes = p.nodes_by_id(ui, 'txt_account')
+    if len(account_nodes) != 1 or account_nodes[0].get('text', '').strip() != EXPECTED_USER:
+        print('RESULT=STOP_USERNAME_INPUT_NOT_CONFIRMED_BEFORE_SUBMIT', flush=True)
+        return None, 'UNKNOWN'
+    confirm_nodes = p.nodes_by_id(ui, 'btn_confirm')
+    if len(confirm_nodes) != 1:
+        print('RESULT=STOP_LOGIN_CONFIRM_NOT_UNIQUE', flush=True)
+        return None, 'UNKNOWN'
+    p.node_tap(confirm_nodes[0])
+    ui, state = wait_for_account_ui()
+    if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'OTHER_EMAIL_VISIBLE'):
+        print('RESULT=STOP_OTHER_ACCOUNT_DETECTED_AFTER_LOGIN', flush=True)
+        return None, state
+    if state == 'AUTHENTICATED_EXPECTED':
+        EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = True
+    elif (
+        state == 'AUTHENTICATED_IDENTITY_UNVERIFIED'
+        and LOGIN_USERNAME_VERIFIED_THIS_RUN
+        and account_screen(ui)
+        and account_identity_status(ui) == 'UNVERIFIED'
+    ):
+        EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = True
+        state = 'AUTHENTICATED_EXPECTED'
+    else:
+        print('RESULT=STOP_EXPECTED_ACCOUNT_IDENTITY_NOT_VERIFIED', flush=True)
+        return None, state
+    if not authenticated_account_screen(ui):
+        print('RESULT=STOP_EXPECTED_ACCOUNT_IDENTITY_NOT_VERIFIED', flush=True)
+        return None, state
+    return ui, state
+
+
 def main():
-    global USERNAME, PASSWORD, AUTHENTICATED
+    global USERNAME, PASSWORD, AUTHENTICATED, EXPECTED_ACCOUNT_VERIFIED_THIS_RUN
+    global LOGIN_USERNAME_VERIFIED_THIS_RUN, INITIAL_STATUS_AVAILABLE, IDENTITY_BLOCKED
+    AUTHENTICATED = False
+    EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = False
+    LOGIN_USERNAME_VERIFIED_THIS_RUN = False
+    INITIAL_STATUS_AVAILABLE = False
+    IDENTITY_BLOCKED = False
+    ATTEMPTED_SERVERS.clear()
     USERNAME = os.environ.get('NCAT_USERNAME', '')
     PASSWORD = os.environ.get('NCAT_PASSWORD', '')
     if USERNAME != EXPECTED_USER or not PASSWORD:
@@ -550,36 +763,21 @@ def main():
         return 1
 
     p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')
-    time.sleep(30)
-    p.tap(648, 1130)  # Previously verified "我的" tab on the pinned 720x1280 app build.
-    time.sleep(5)
-    ui = p.read_ui()
-    p.node_tap(p.node_by_id(ui, 'txt_user'))
-    time.sleep(4)
-    ui = p.read_ui()
-    p.node_tap(p.node_by_id(ui, 'txt_account'))
-    p.send_text(USERNAME)
-    ui = p.read_ui()
-    if p.node_by_id(ui, 'txt_account').get('text', '') != EXPECTED_USER:
-        print('RESULT=STOP_USERNAME_INPUT_NOT_CONFIRMED')
-        return 1
-    p.node_tap(p.node_by_id(ui, 'txt_pwd'))
-    p.send_text(PASSWORD)
-    p.adb('shell', 'input', 'keyevent', '4')
-    ui = p.read_ui()
-    p.node_tap(p.node_by_id(ui, 'btn_confirm'))
-    time.sleep(12)
-    ui = p.read_ui()
-    ids = [node.get('resource-id', '') for node in ui.iter()]
-    if any(value.endswith(':id/txt_pwd') for value in ids) or not any(value.endswith(':id/txt_accelerate') for value in ids):
-        print('RESULT=STOP_LOGIN_NOT_CONFIRMED')
-        return 1
-    if not authenticated_account_screen(ui):
-        print('RESULT=STOP_LOGIN_NOT_CONFIRMED')
+    ui, state = wait_for_account_ui()
+    if state in ('LOGIN_FORM', 'LOGGED_OUT'):
+        ui, state = login_expected_account(ui, state)
+        if ui is None:
+            return 1
+    if state != 'AUTHENTICATED_EXPECTED' or not authenticated_account_screen(ui):
+        if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'AUTHENTICATED_IDENTITY_UNVERIFIED', 'OTHER_EMAIL_VISIBLE'):
+            print('RESULT=STOP_ACCOUNT_IDENTITY_UNVERIFIED_NO_CHECKIN')
+        else:
+            print('RESULT=STOP_APP_UI_UNKNOWN_NO_CHECKIN')
         return 1
     AUTHENTICATED = True
+    EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = True
 
-    # First action after login is a read-only status check; already-signed accounts stop here.
+    # Only the exact expected bot identity reaches this first read-only status check.
     evidence('01-initial', ui)
     initial_status = account_status(ui)
     if initial_status == 'SIGNED_IN':
@@ -591,6 +789,7 @@ def main():
         print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK', flush=True)
         return 1
     print('INITIAL_STATUS=今日签到', flush=True)
+    INITIAL_STATUS_AVAILABLE = True
 
     settings = open_settings_from_account()
     if settings is None:
@@ -627,7 +826,10 @@ def main():
                 return 1
             ui = line_ui
 
-        # Read-only status is checked on each distinct line before any sign-in tap.
+        if not AUTHENTICATED or not authenticated_account_screen(line_ui):
+            print('RESULT=STOP_EXPECTED_ACCOUNT_NOT_VERIFIED_NO_CLICK', flush=True)
+            return 1
+        # Read-only status is checked on each distinct line before any check-in tap.
         status = account_status(line_ui)
         if status == 'SIGNED_IN':
             evidence('04-already-signed-' + server, line_ui)

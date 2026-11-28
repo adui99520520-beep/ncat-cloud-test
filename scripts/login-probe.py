@@ -13,12 +13,12 @@ GUEST_MARKERS = ('尚未登陆', '尚未登录', '请登录', '请登陆', '点�
 SUCCESS_MARKERS = ('签到成功', '今日已签到', '已经签到', '已签到', '签到完成')
 
 
-def adb(*args, capture=False):
+def adb(*args, capture=False, timeout=45):
     p = subprocess.run(
         ['adb', '-s', DEVICE, *args],
         stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        timeout=45,
+        timeout=timeout,
     )
     if p.returncode != 0:
         raise RuntimeError('ADB operation failed')
@@ -36,9 +36,9 @@ def send_text(value):
     adb('shell', 'input', 'text', shlex.quote(value.replace(' ', '%s')))
 
 
-def read_ui():
-    adb('shell', 'uiautomator', 'dump', '/sdcard/ui.xml')
-    raw = adb('exec-out', 'cat', '/sdcard/ui.xml', capture=True)
+def read_ui(timeout=45):
+    adb('shell', 'uiautomator', 'dump', '/sdcard/ui.xml', timeout=timeout)
+    raw = adb('exec-out', 'cat', '/sdcard/ui.xml', capture=True, timeout=timeout)
     return ET.fromstring(raw)
 
 
