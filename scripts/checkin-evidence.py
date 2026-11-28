@@ -33,6 +33,75 @@ LOGIN_USERNAME_VERIFIED_THIS_RUN = False
 INITIAL_STATUS_AVAILABLE = False
 ATTEMPTED_SERVERS = set()
 IDENTITY_BLOCKED = False
+CHECKIN_MODE = 'checkin'
+SUMMARY_MODE = 'checkin'
+SUMMARY_IDENTITY_STATUS = 'UNKNOWN'
+SUMMARY_TODAY_STATUS = 'NOT_READ'
+SUMMARY_ATTEMPTED_ROUTES = []
+ENTRY_CLICK_ATTEMPTED = False
+CONFIRM_CLICK_ATTEMPTED = False
+SUMMARY_RESULT_CODE = 'NOT_STARTED'
+SUMMARY_RESULT_CODES = frozenset((
+    'NOT_STARTED', 'STOP_INVALID_MODE', 'STOP_ACCOUNT_CONFIG',
+    'STOP_IDENTITY_UNVERIFIED', 'STOP_APP_UI_UNKNOWN', 'STOP_STATUS_UNKNOWN',
+    'ALREADY_CHECKED_IN', 'VERIFY_STATUS_AVAILABLE', 'CHECKIN_IN_PROGRESS',
+    'CHECKIN_COMPLETE', 'CHECKIN_STOP', 'STOP_ERROR', 'STOP_NETWORK_IO_EXHAUSTED',
+))
+
+
+def identity_summary_code(state):
+    if state == 'AUTHENTICATED_EXPECTED':
+        return 'VERIFIED_EXPECTED'
+    if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'OTHER_EMAIL_VISIBLE'):
+        return 'OTHER_ACCOUNT'
+    if state == 'AUTHENTICATED_IDENTITY_UNVERIFIED':
+        return 'UNVERIFIED'
+    return 'UNKNOWN'
+
+
+def write_step_summary():
+    """Append only allowlisted status codes, supported routes, and click booleans."""
+    summary_path = os.environ.get('GITHUB_STEP_SUMMARY', '')
+    if not summary_path:
+        return
+    mode = SUMMARY_MODE if SUMMARY_MODE in ('checkin', 'verify', 'invalid') else 'invalid'
+    identity = SUMMARY_IDENTITY_STATUS if SUMMARY_IDENTITY_STATUS in (
+        'UNKNOWN', 'VERIFIED_EXPECTED', 'UNVERIFIED', 'OTHER_ACCOUNT'
+    ) else 'UNKNOWN'
+    status = SUMMARY_TODAY_STATUS if SUMMARY_TODAY_STATUS in (
+        'NOT_READ', 'AVAILABLE', 'SIGNED_IN', 'UNKNOWN'
+    ) else 'UNKNOWN'
+    routes = []
+    for server in SUMMARY_ATTEMPTED_ROUTES:
+        if server in ALLOWED_SERVERS and server not in routes:
+            routes.append(server)
+            if len(routes) == 5:
+                break
+    result = SUMMARY_RESULT_CODE if SUMMARY_RESULT_CODE in SUMMARY_RESULT_CODES else 'UNKNOWN'
+    lines = (
+        'mode=' + mode,
+        'identity_status=' + identity,
+        'today_status=' + status,
+        'attempted_routes=' + (','.join(routes) if routes else 'none'),
+        'entry_click_attempted=' + ('yes' if ENTRY_CLICK_ATTEMPTED else 'no'),
+        'confirmation_click_attempted=' + ('yes' if CONFIRM_CLICK_ATTEMPTED else 'no'),
+        'result_code=' + result,
+    )
+    try:
+        with open(summary_path, 'a', encoding='utf-8') as output:
+            output.write('\n'.join(lines) + '\n')
+    except Exception:
+        print('STEP_SUMMARY_WRITE=FAILED', flush=True)
+
+
+def record_route_attempt(server):
+    """Record a route only when its check-in entry tap is about to be attempted."""
+    if server not in ALLOWED_SERVERS or server in SUMMARY_ATTEMPTED_ROUTES:
+        return False
+    if len(SUMMARY_ATTEMPTED_ROUTES) >= 5:
+        return False
+    SUMMARY_ATTEMPTED_ROUTES.append(server)
+    return True
 
 
 def scrub(value):
@@ -161,9 +230,10 @@ def visible_other_email(root):
 
 
 def block_on_other_email(root):
-    global IDENTITY_BLOCKED
+    global IDENTITY_BLOCKED, SUMMARY_IDENTITY_STATUS
     if visible_other_email(root):
         IDENTITY_BLOCKED = True
+        SUMMARY_IDENTITY_STATUS = 'OTHER_ACCOUNT'
         return True
     return False
 
@@ -291,13 +361,15 @@ def evidence(label, root=None):
 
 def read_authenticated_account_screen():
     """Return to the user's account tab without touching any ad or check-in control."""
-    global IDENTITY_BLOCKED
+    global IDENTITY_BLOCKED, SUMMARY_IDENTITY_STATUS
     for _ in range(3):
         ui, state = wait_for_account_ui(timeout=30)
         if state == 'AUTHENTICATED_EXPECTED' and authenticated_account_screen(ui):
+            SUMMARY_IDENTITY_STATUS = 'VERIFIED_EXPECTED'
             return ui
         if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'AUTHENTICATED_IDENTITY_UNVERIFIED', 'OTHER_EMAIL_VISIBLE', 'LOGIN_FORM', 'LOGGED_OUT', 'AMBIGUOUS_LOGIN_FORM'):
             IDENTITY_BLOCKED = True
+            SUMMARY_IDENTITY_STATUS = identity_summary_code(state)
             return None
         try:
             p.adb('shell', 'input', 'keyevent', '4')
@@ -344,6 +416,9 @@ def server_order(current):
 
 def switch_server(target):
     """Select one exact supported server and verify the app reflects that choice."""
+    if CHECKIN_MODE != 'checkin':
+        print('LINE_SWITCH=STOP_MODE_NOT_CHECKIN', flush=True)
+        return 'STOP', None
     settings = open_settings_from_account()
     if settings is None:
         print('LINE_SWITCH=STOP_SETTINGS_NOT_VERIFIED', flush=True)
@@ -433,13 +508,16 @@ def switch_server(target):
 
 
 def persistent_status_after_attempt(server):
+    global SUMMARY_TODAY_STATUS
     ui = read_authenticated_account_screen()
     if ui is None:
+        SUMMARY_TODAY_STATUS = 'UNKNOWN'
         return 'UNREAD', None
     evidence('04-persistent-account-status-' + server, ui)
     if not authenticated_account_screen(ui):
         return 'UNREAD', ui
     status = account_status(ui)
+    SUMMARY_TODAY_STATUS = status if status in ('SIGNED_IN', 'AVAILABLE') else 'UNKNOWN'
     if status == 'SIGNED_IN':
         print('PERSISTENT_STATUS=已签到', flush=True)
     elif status == 'AVAILABLE':
@@ -486,6 +564,10 @@ def retry_decision_after_network_error(server, ui=None, image_path=None):
 
 def attempt_on_server(server, initial_ui):
     """Try one line once; return RETRY only for a detected network-I/O exception."""
+    global ENTRY_CLICK_ATTEMPTED, CONFIRM_CLICK_ATTEMPTED
+    if CHECKIN_MODE != 'checkin':
+        print('RESULT=STOP_MODE_NOT_CHECKIN_NO_CLICK', flush=True)
+        return 1
     if not AUTHENTICATED or not authenticated_account_screen(initial_ui):
         print('RESULT=STOP_EXPECTED_ACCOUNT_NOT_VERIFIED_NO_CLICK', flush=True)
         return 1
@@ -501,6 +583,9 @@ def attempt_on_server(server, initial_ui):
         print('INITIAL_STATUS=未知', flush=True)
         print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK', flush=True)
         return 1
+    if server not in ALLOWED_SERVERS:
+        print('RESULT=STOP_UNSUPPORTED_LINE_NO_CLICK', flush=True)
+        return 1
     if server in ATTEMPTED_SERVERS:
         print('RESULT=STOP_DUPLICATE_LINE_BLOCKED', flush=True)
         return 1
@@ -511,6 +596,8 @@ def attempt_on_server(server, initial_ui):
     print('INITIAL_STATUS=今日签到', flush=True)
     clear_logcat()
     button = p.node_by_id(initial_ui, 'txt_accelerate')
+    record_route_attempt(server)
+    ENTRY_CLICK_ATTEMPTED = True
     p.node_tap(button)
     print('ENTRY_TAPPED_ONCE=' + server, flush=True)
     entry_time = time.monotonic()
@@ -617,6 +704,7 @@ def attempt_on_server(server, initial_ui):
         print('RESULT=STOP_ACCOUNT_OR_INITIAL_STATUS_NOT_VERIFIED_NO_CONFIRM_TAP', flush=True)
         return 1
     print('COUNTDOWN_WAITED_CONFIRM_TARGET=EXACT_TOP_RIGHT', flush=True)
+    CONFIRM_CLICK_ATTEMPTED = True
     p.node_tap(next(iter(candidates.values())))
     confirm_time = time.monotonic()
     print('CONFIRM_TAPPED_ONCE=' + server, flush=True)
@@ -750,15 +838,35 @@ def login_expected_account(ui, state):
 def main():
     global USERNAME, PASSWORD, AUTHENTICATED, EXPECTED_ACCOUNT_VERIFIED_THIS_RUN
     global LOGIN_USERNAME_VERIFIED_THIS_RUN, INITIAL_STATUS_AVAILABLE, IDENTITY_BLOCKED
+    global CHECKIN_MODE, SUMMARY_MODE, SUMMARY_IDENTITY_STATUS, SUMMARY_TODAY_STATUS
+    global ENTRY_CLICK_ATTEMPTED, CONFIRM_CLICK_ATTEMPTED, SUMMARY_RESULT_CODE
     AUTHENTICATED = False
     EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = False
     LOGIN_USERNAME_VERIFIED_THIS_RUN = False
     INITIAL_STATUS_AVAILABLE = False
     IDENTITY_BLOCKED = False
     ATTEMPTED_SERVERS.clear()
+    CHECKIN_MODE = 'checkin'
+    SUMMARY_MODE = 'checkin'
+    SUMMARY_IDENTITY_STATUS = 'UNKNOWN'
+    SUMMARY_TODAY_STATUS = 'NOT_READ'
+    SUMMARY_ATTEMPTED_ROUTES.clear()
+    ENTRY_CLICK_ATTEMPTED = False
+    CONFIRM_CLICK_ATTEMPTED = False
+    SUMMARY_RESULT_CODE = 'NOT_STARTED'
+    raw_mode = os.environ.get('CHECKIN_MODE', 'checkin')
+    if raw_mode not in ('checkin', 'verify'):
+        CHECKIN_MODE = 'invalid'
+        SUMMARY_MODE = 'invalid'
+        SUMMARY_RESULT_CODE = 'STOP_INVALID_MODE'
+        print('RESULT=STOP_INVALID_MODE_NO_CLICK', flush=True)
+        return 1
+    CHECKIN_MODE = raw_mode
+    SUMMARY_MODE = raw_mode
     USERNAME = os.environ.get('NCAT_USERNAME', '')
     PASSWORD = os.environ.get('NCAT_PASSWORD', '')
     if USERNAME != EXPECTED_USER or not PASSWORD:
+        SUMMARY_RESULT_CODE = 'STOP_ACCOUNT_CONFIG'
         print('RESULT=STOP_ACCOUNT_MISMATCH_OR_MISSING_SECRET')
         return 1
 
@@ -767,29 +875,44 @@ def main():
     if state in ('LOGIN_FORM', 'LOGGED_OUT'):
         ui, state = login_expected_account(ui, state)
         if ui is None:
+            SUMMARY_IDENTITY_STATUS = identity_summary_code(state)
+            SUMMARY_RESULT_CODE = 'STOP_IDENTITY_UNVERIFIED'
             return 1
     if state != 'AUTHENTICATED_EXPECTED' or not authenticated_account_screen(ui):
+        SUMMARY_IDENTITY_STATUS = identity_summary_code(state)
         if state in ('AUTHENTICATED_OTHER_ACCOUNT', 'AUTHENTICATED_IDENTITY_UNVERIFIED', 'OTHER_EMAIL_VISIBLE'):
+            SUMMARY_RESULT_CODE = 'STOP_IDENTITY_UNVERIFIED'
             print('RESULT=STOP_ACCOUNT_IDENTITY_UNVERIFIED_NO_CHECKIN')
         else:
+            SUMMARY_RESULT_CODE = 'STOP_APP_UI_UNKNOWN'
             print('RESULT=STOP_APP_UI_UNKNOWN_NO_CHECKIN')
         return 1
     AUTHENTICATED = True
     EXPECTED_ACCOUNT_VERIFIED_THIS_RUN = True
+    SUMMARY_IDENTITY_STATUS = 'VERIFIED_EXPECTED'
 
     # Only the exact expected bot identity reaches this first read-only status check.
-    evidence('01-initial', ui)
+    if CHECKIN_MODE == 'checkin':
+        evidence('01-initial', ui)
     initial_status = account_status(ui)
+    SUMMARY_TODAY_STATUS = initial_status if initial_status in ('SIGNED_IN', 'AVAILABLE') else 'UNKNOWN'
     if initial_status == 'SIGNED_IN':
+        SUMMARY_RESULT_CODE = 'ALREADY_CHECKED_IN'
         print('INITIAL_STATUS=已签到', flush=True)
         print('RESULT=ALREADY_CHECKED_IN', flush=True)
         return 0
     if initial_status != 'AVAILABLE':
+        SUMMARY_RESULT_CODE = 'STOP_STATUS_UNKNOWN'
         print('INITIAL_STATUS=未知', flush=True)
         print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK', flush=True)
         return 1
     print('INITIAL_STATUS=今日签到', flush=True)
     INITIAL_STATUS_AVAILABLE = True
+    if CHECKIN_MODE == 'verify':
+        SUMMARY_RESULT_CODE = 'VERIFY_STATUS_AVAILABLE'
+        print('RESULT=VERIFY_STATUS_AVAILABLE', flush=True)
+        return 0
+    SUMMARY_RESULT_CODE = 'CHECKIN_IN_PROGRESS'
 
     settings = open_settings_from_account()
     if settings is None:
@@ -831,7 +954,9 @@ def main():
             return 1
         # Read-only status is checked on each distinct line before any check-in tap.
         status = account_status(line_ui)
+        SUMMARY_TODAY_STATUS = status if status in ('SIGNED_IN', 'AVAILABLE') else 'UNKNOWN'
         if status == 'SIGNED_IN':
+            SUMMARY_RESULT_CODE = 'ALREADY_CHECKED_IN'
             evidence('04-already-signed-' + server, line_ui)
             print('PERSISTENT_STATUS=已签到', flush=True)
             print('RESULT=ALREADY_CHECKED_IN', flush=True)
@@ -856,16 +981,33 @@ def main():
 
     print('RESULT=STOP_ALL_LINES_EXHAUSTED_NETWORK_IO', flush=True)
     print('PERSISTENT_STATUS=未确认', flush=True)
+    SUMMARY_TODAY_STATUS = 'UNKNOWN'
+    SUMMARY_RESULT_CODE = 'STOP_NETWORK_IO_EXHAUSTED'
     return 1
 
 
-if __name__ == '__main__':
+def run():
+    global SUMMARY_RESULT_CODE
+    exit_code = 1
     try:
-        sys.exit(main())
+        exit_code = main()
     except Exception as exc:
+        SUMMARY_RESULT_CODE = 'STOP_ERROR'
         print('RESULT=STOP_ERROR_' + type(exc).__name__)
         if isinstance(exc, RuntimeError):
             print('REASON=' + scrub(str(exc)))
-        if AUTHENTICATED:
-            evidence('99-error')
-        sys.exit(1)
+        if AUTHENTICATED and CHECKIN_MODE == 'checkin':
+            try:
+                evidence('99-error')
+            except Exception:
+                pass
+        exit_code = 1
+    finally:
+        if SUMMARY_RESULT_CODE == 'CHECKIN_IN_PROGRESS':
+            SUMMARY_RESULT_CODE = 'CHECKIN_COMPLETE' if exit_code == 0 else 'CHECKIN_STOP'
+        write_step_summary()
+    return exit_code
+
+
+if __name__ == '__main__':
+    sys.exit(run())

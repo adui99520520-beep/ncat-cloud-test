@@ -1,6 +1,15 @@
 name: One-time check-in with encrypted evidence
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Execution mode
+        required: false
+        type: choice
+        options:
+          - checkin
+          - verify
+        default: checkin
 permissions:
   contents: read
 jobs:
@@ -37,6 +46,7 @@ jobs:
           NCAT_USERNAME: ${{ secrets.NCAT_USERNAME }}
           NCAT_PASSWORD: ${{ secrets.NCAT_PASSWORD }}
           EVIDENCE_DIR: checkin-evidence
+          CHECKIN_MODE: ${{ inputs.mode || 'checkin' }}
         run: |
           set +e
           python3 scripts/checkin-evidence.py > checkin-evidence/run.log 2>&1
