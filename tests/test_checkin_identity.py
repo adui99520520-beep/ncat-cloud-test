@@ -426,10 +426,11 @@ class CheckinIdentityTests(unittest.TestCase):
             return next(answers)
 
         with patch.object(probe, 'read_ui', side_effect=read_ui), patch.object(checkin.time, 'sleep'):
-            ui, state = checkin.wait_for_account_ui(timeout=5)
+            ui, state = checkin.wait_for_account_ui(timeout=60)
         self.assertIs(ui, login)
         self.assertEqual(state, 'LOGIN_FORM')
-        self.assertTrue(timeouts and all(0 < timeout <= 5 for timeout in timeouts))
+        self.assertTrue(timeouts and all(0 < timeout <= checkin.APP_UI_COMMAND_TIMEOUT for timeout in timeouts))
+        self.assertGreater(max(timeouts), 5)
 
         with patch.object(probe, 'read_ui') as read_ui_mock:
             ui, state = checkin.wait_for_account_ui(timeout=0)

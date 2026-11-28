@@ -21,7 +21,7 @@ EXPECTED_USER = 'adui99520520@bot.cue.im'
 ALLOWED_SERVERS = ('精品1', '精品2', '精品3', '优化1', '精品5')
 APP_UI_READY_TIMEOUT = 90
 APP_UI_POLL_INTERVAL = 2
-APP_UI_COMMAND_TIMEOUT = 5
+APP_UI_COMMAND_TIMEOUT = 30
 # Prefer the last known working line, but start with the app's current line and
 # visit every other supported line at most once.
 PREFERRED_SERVERS = ('精品3', '精品1', '精品2', '优化1', '精品5')
