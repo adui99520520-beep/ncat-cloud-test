@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Controlled check-in with minimal, redacted UI evidence. Do not run unless explicitly authorized."""
+"""Controlled check-in with private, encrypted evidence. Never logs credentials."""
 import importlib.util
 import os
 import re
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -15,38 +16,92 @@ COUNTDOWN_LOG.write_text('Observed countdown values after entry tap:\n', encodin
 spec = importlib.util.spec_from_file_location('probe', 'scripts/login-probe.py')
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
+
 EXPECTED_USER = 'adui99520520@bot.cue.im'
+ALLOWED_SERVERS = ('精品1', '精品2', '精品3', '优化1', '精品5')
+# Prefer the last known working line, but start with the app's current line and
+# visit every other supported line at most once.
+PREFERRED_SERVERS = ('精品3', '精品1', '精品2', '优化1', '精品5')
 USERNAME = ''
 PASSWORD = ''
 AUTHENTICATED = False
+ATTEMPTED_SERVERS = set()
 
 
-def scrub(s):
-    s = str(s or '')
+def scrub(value):
+    value = str(value or '')
     for secret in (USERNAME, PASSWORD):
         if secret:
-            s = s.replace(secret, '[REDACTED]')
-    s = re.sub(r'(?i)(password|passwd|pwd|token|secret)(\s*[=:：]\s*)[^\s,;]+', r'\1\2[REDACTED]', s)
-    s = re.sub(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '[EMAIL_REDACTED]', s)
-    return s
+            value = value.replace(secret, '[REDACTED]')
+    value = re.sub(r'(?i)(password|passwd|pwd|token|secret)(\s*[=:：]\s*)[^\s,;]+', r'\1\2[REDACTED]', value)
+    value = re.sub(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', '[EMAIL_REDACTED]', value)
+    return value
 
 
 def texts(root):
-    return [v for n in root.iter() for v in (n.get('text', ''), n.get('content-desc', '')) if v]
+    if root is None:
+        return []
+    return [value for node in root.iter() for value in (node.get('text', ''), node.get('content-desc', '')) if value]
 
 
 def success(root):
-    ts = texts(root)
-    return any('签到成功' in v for v in ts), any('已签到' in v for v in ts)
+    values = texts(root)
+    return any(any(marker in value for marker in ('签到成功', '今日已签到', '已经签到', '已签到', '签到完成')) for value in values)
 
 
-COUNTDOWN_RE = re.compile(r'(?:倒计时\s*[:：]?\s*)?(\d+)\s*(秒|s)(?:后)?|倒计时\s*[:：]?\s*(\d+)', re.I)
+def compact_text(value):
+    return re.sub(r'\s+', '', str(value or '')).lower()
+
+
+def has_network_io_error(value):
+    value = compact_text(value)
+    return bool(re.search(r'网络[i1l]/?[o0]异常|network[i1l]/?[o0]exception', value, re.I)) or '网络io异常' in value
+
+
+def image_has_network_io_error(image_path):
+    """OCR the disposable screenshot in memory; never emit OCR text to Actions logs."""
+    if not image_path or not Path(image_path).is_file():
+        return False
+    try:
+        result = subprocess.run(
+            ['tesseract', str(image_path), 'stdout', '-l', 'chi_sim+eng', '--psm', '11'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        return has_network_io_error(result.stdout.decode('utf-8', errors='ignore'))
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def network_io_error(root=None, image_path=None, inspect_logcat=True):
+    if any(has_network_io_error(value) for value in texts(root)):
+        return True
+    if image_has_network_io_error(image_path):
+        return True
+    if inspect_logcat:
+        try:
+            logcat = p.adb('logcat', '-d', '-t', '350', capture=True).decode('utf-8', errors='ignore')
+            if has_network_io_error(logcat):
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def clear_logcat():
+    try:
+        p.adb('logcat', '-c')
+    except Exception:
+        pass
 
 
 def countdown_values(root):
     values = []
+    pattern = re.compile(r'(?:倒计时\s*[:：]?\s*)?(\d+)\s*(秒|s)(?:后)?|倒计时\s*[:：]?\s*(\d+)', re.I)
     for value in texts(root):
-        for match in COUNTDOWN_RE.finditer(value):
+        for match in pattern.finditer(value):
             number = match.group(1) or match.group(3)
             unit = match.group(2) or ''
             label = number + unit
@@ -60,49 +115,443 @@ def record_countdown(root, entry_time, seen):
         if value in seen:
             continue
         seen.add(value)
-        elapsed = time.monotonic() - entry_time
-        line = f't+{elapsed:.2f}s {value}'
-        with COUNTDOWN_LOG.open('a', encoding='utf-8') as f:
-            f.write(line + '\n')
+        line = f't+{time.monotonic() - entry_time:.2f}s {value}'
+        with COUNTDOWN_LOG.open('a', encoding='utf-8') as output:
+            output.write(line + '\n')
         print('COUNTDOWN_OBSERVED=' + value, flush=True)
 
 
 def account_screen(root):
-    ids = [n.get('resource-id', '') for n in root.iter()]
-    return any(x.endswith(':id/txt_accelerate') for x in ids) and any(x.endswith(':id/txt_user') for x in ids)
+    ids = [node.get('resource-id', '') for node in root.iter()]
+    return any(value.endswith(':id/txt_accelerate') for value in ids) and any(value.endswith(':id/txt_user') for value in ids)
+
+
+def authenticated_account_screen(root):
+    if not account_screen(root):
+        return False
+    try:
+        label = p.node_by_id(root, 'txt_user').get('text', '').strip()
+    except Exception:
+        return False
+    return bool(label) and '尚未登陆' not in label and '尚未登录' not in label
+
+
+def account_status(root):
+    if not account_screen(root):
+        return 'NOT_ACCOUNT_SCREEN'
+    if success(root):
+        return 'SIGNED_IN'
+    try:
+        button = p.node_by_id(root, 'txt_accelerate').get('text', '').strip()
+    except Exception:
+        return 'UNKNOWN'
+    if button == '今日签到':
+        return 'AVAILABLE'
+    if '已签到' in button:
+        return 'SIGNED_IN'
+    return 'UNKNOWN'
+
+
+def exact_text_nodes(root, value):
+    return [node for node in root.iter() if node.get('text', '').strip() == value or node.get('content-desc', '').strip() == value]
+
+
+def node_bounds(node):
+    values = list(map(int, re.findall(r'\d+', node.get('bounds', ''))))
+    return tuple(values) if len(values) == 4 else None
+
+
+def tap_unique_text(root, value):
+    matches = exact_text_nodes(root, value)
+    if len(matches) != 1:
+        return False
+    bounds = node_bounds(matches[0])
+    if not bounds or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+        return False
+    p.node_tap(matches[0])
+    return True
 
 
 def evidence(label, root=None):
-    """Best-effort UI dump and screenshot; keep only short, sanitized text."""
+    """Save only to the private run directory; the workflow encrypts it before upload."""
+    image_path = BASE / (label + '.png')
     try:
-        (BASE / (label + '.png')).write_bytes(p.adb('exec-out', 'screencap', '-p', capture=True))
-    except Exception as e:
-        print('EVIDENCE_SCREENSHOT_ERROR=' + type(e).__name__, flush=True)
+        image_path.write_bytes(p.adb('exec-out', 'screencap', '-p', capture=True))
+    except Exception as exc:
+        print('EVIDENCE_SCREENSHOT_ERROR=' + type(exc).__name__, flush=True)
+        image_path = None
     if root is None:
         try:
             root = p.read_ui()
-        except Exception as e:
-            print('EVIDENCE_UI_ERROR=' + type(e).__name__, flush=True)
-            return
+        except Exception as exc:
+            print('EVIDENCE_UI_ERROR=' + type(exc).__name__, flush=True)
+            return image_path
     lines = []
-    for n in root.iter():
-        text = scrub(n.get('text', '') or n.get('content-desc', '')).strip()
-        rid = n.get('resource-id', '').rsplit('/', 1)[-1]
-        if text:
-            lines.append((rid + ': ' if rid else '') + text[:180])
+    for node in root.iter():
+        value = scrub(node.get('text', '') or node.get('content-desc', '')).strip()
+        resource_id = node.get('resource-id', '').rsplit('/', 1)[-1]
+        if value:
+            lines.append((resource_id + ': ' if resource_id else '') + value[:180])
     content = '\n'.join(lines[:100])[:10000]
     (BASE / (label + '.txt')).write_text(content + ('\n' if content else ''), encoding='utf-8')
+    return image_path
+
+
+def read_authenticated_account_screen():
+    """Return to the user's account tab without touching any ad or check-in control."""
+    for _ in range(3):
+        try:
+            ui = p.read_ui()
+        except Exception:
+            ui = None
+        if ui is not None and authenticated_account_screen(ui):
+            return ui
+        if ui is not None:
+            my_tabs = exact_text_nodes(ui, '我的')
+            if len(my_tabs) == 1:
+                try:
+                    p.node_tap(my_tabs[0])
+                    time.sleep(2)
+                    ui = p.read_ui()
+                    if authenticated_account_screen(ui):
+                        return ui
+                except Exception:
+                    pass
+        try:
+            p.adb('shell', 'input', 'keyevent', '4')
+            time.sleep(1.5)
+        except Exception:
+            break
+    return None
+
+
+def open_settings_from_account():
+    ui = read_authenticated_account_screen()
+    if ui is None:
+        return None
+    if not tap_unique_text(ui, '应用设置'):
+        return None
+    time.sleep(1.5)
+    try:
+        settings = p.read_ui()
+        line = p.node_by_id(settings, 'txt_line')
+        if line.get('text', '').strip() not in ALLOWED_SERVERS:
+            return None
+        return settings
+    except Exception:
+        return None
+
+
+def go_back_to_account():
+    try:
+        p.adb('shell', 'input', 'keyevent', '4')
+        time.sleep(1.5)
+    except Exception:
+        return None
+    return read_authenticated_account_screen()
+
+
+def server_order(current):
+    if current not in ALLOWED_SERVERS:
+        return []
+    return [current] + [server for server in PREFERRED_SERVERS if server != current]
+
+
+def switch_server(target):
+    """Select one exact supported server and verify the app reflects that choice."""
+    settings = open_settings_from_account()
+    if settings is None:
+        print('LINE_SWITCH=STOP_SETTINGS_NOT_VERIFIED', flush=True)
+        return 'STOP', None
+    try:
+        current = p.node_by_id(settings, 'txt_line').get('text', '').strip()
+    except Exception:
+        print('LINE_SWITCH=STOP_CURRENT_LINE_UNKNOWN', flush=True)
+        return 'STOP', None
+    if current not in ALLOWED_SERVERS or target not in ALLOWED_SERVERS:
+        print('LINE_SWITCH=STOP_UNSUPPORTED_LINE', flush=True)
+        return 'STOP', None
+    if current != target:
+        if not tap_unique_text(settings, current):
+            print('LINE_SWITCH=STOP_PICKER_ENTRY_NOT_UNIQUE', flush=True)
+            return 'STOP', None
+        time.sleep(1)
+        try:
+            picker = p.read_ui()
+        except Exception:
+            print('LINE_SWITCH=STOP_PICKER_NOT_READABLE', flush=True)
+            return 'STOP', None
+        if '选择应用服务器' not in texts(picker):
+            error = network_io_error(picker)
+            print('LINE_SWITCH=' + ('NETWORK_IO' if error else 'STOP_PICKER_NOT_VERIFIED'), flush=True)
+            try:
+                p.adb('shell', 'input', 'keyevent', '4')
+                time.sleep(1)
+            except Exception:
+                pass
+            return ('NETWORK_IO' if error else 'STOP'), None
+        options = exact_text_nodes(picker, target)
+        if len(options) != 1:
+            # 精品5 is at the bottom edge on the known 720x1280 build. Scroll
+            # only inside the server list, then re-read and require one exact row.
+            try:
+                p.adb('shell', 'input', 'swipe', '360', '1110', '360', '720', '450')
+                time.sleep(0.5)
+                picker = p.read_ui()
+                options = exact_text_nodes(picker, target)
+            except Exception:
+                options = []
+        if len(options) != 1:
+            print('LINE_SWITCH=STOP_TARGET_NOT_UNIQUE', flush=True)
+            try:
+                p.adb('shell', 'input', 'keyevent', '4')
+                time.sleep(1)
+            except Exception:
+                pass
+            return 'STOP', None
+        bounds = node_bounds(options[0])
+        if not bounds or (bounds[0] + bounds[2]) // 2 < 0 or (bounds[0] + bounds[2]) // 2 >= 720 or (bounds[1] + bounds[3]) // 2 >= 1180:
+            print('LINE_SWITCH=STOP_TARGET_NOT_VISIBLE', flush=True)
+            return 'STOP', None
+        p.node_tap(options[0])
+        time.sleep(1.5)
+        try:
+            settings = p.read_ui()
+            chosen = p.node_by_id(settings, 'txt_line').get('text', '').strip()
+        except Exception:
+            print('LINE_SWITCH=STOP_SELECTED_LINE_UNREADABLE', flush=True)
+            return 'STOP', None
+        if chosen != target:
+            error = network_io_error(settings)
+            print('LINE_SWITCH=' + ('NETWORK_IO' if error else 'STOP_SELECTION_NOT_CONFIRMED'), flush=True)
+            try:
+                p.adb('shell', 'input', 'keyevent', '4')
+                time.sleep(1)
+            except Exception:
+                pass
+            return ('NETWORK_IO' if error else 'STOP'), None
+    print('LINE_SELECTED=' + target, flush=True)
+    ui = go_back_to_account()
+    if ui is None:
+        print('LINE_SWITCH=STOP_ACCOUNT_SCREEN_NOT_REACHED', flush=True)
+        return 'STOP', None
+    return 'OK', ui
+
+
+def persistent_status_after_attempt(server):
+    ui = read_authenticated_account_screen()
+    if ui is None:
+        return 'UNREAD', None
+    evidence('04-persistent-account-status-' + server, ui)
+    if not authenticated_account_screen(ui):
+        return 'UNREAD', ui
+    status = account_status(ui)
+    if status == 'SIGNED_IN':
+        print('PERSISTENT_STATUS=已签到', flush=True)
+    elif status == 'AVAILABLE':
+        print('PERSISTENT_STATUS=今日签到', flush=True)
+    else:
+        print('PERSISTENT_STATUS=UNKNOWN', flush=True)
+    return status, ui
+
+
+def find_confirm_target(root):
+    matches = {}
+    for node in root.iter():
+        label = node.get('text', '').strip() or node.get('content-desc', '').strip()
+        if label != '点击签到' or node.get('enabled', 'false') != 'true' or node.get('visible-to-user', 'false') != 'true':
+            continue
+        bounds = node_bounds(node)
+        if not bounds:
+            continue
+        left, top, right, bottom = bounds
+        center_x, center_y = (left + right) // 2, (top + bottom) // 2
+        if right > left and bottom > top and center_x >= 360 and center_y <= 425:
+            matches[tuple(bounds)] = node
+    return matches
+
+
+def retry_decision_after_network_error(server, ui=None, image_path=None):
+    if not network_io_error(ui, image_path):
+        return None
+    print('NETWORK_IO_ERROR_DETECTED=YES', flush=True)
+    status, _ = persistent_status_after_attempt(server)
+    if status == 'SIGNED_IN':
+        print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
+        return 0
+    if status == 'AVAILABLE' or status == 'UNREAD':
+        # The next server gets a fresh read-only status check before any tap.
+        print('NETWORK_IO_RETRY_NEXT_DISTINCT_LINE=' + server, flush=True)
+        return 'RETRY'
+    print('RESULT=STOP_PERSISTENT_STATUS_UNKNOWN_AFTER_NETWORK_IO', flush=True)
+    return 1
+
+
+def attempt_on_server(server, initial_ui):
+    """Try one line once; return RETRY only for a detected network-I/O exception."""
+    status = account_status(initial_ui)
+    if status == 'SIGNED_IN':
+        print('RESULT=ALREADY_CHECKED_IN', flush=True)
+        print('PERSISTENT_STATUS=已签到', flush=True)
+        return 0
+    if status != 'AVAILABLE':
+        print('INITIAL_STATUS=未知', flush=True)
+        print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK', flush=True)
+        return 1
+    if server in ATTEMPTED_SERVERS:
+        print('RESULT=STOP_DUPLICATE_LINE_BLOCKED', flush=True)
+        return 1
+
+    # Mark the line before the first check-in entry tap. No code path can tap it again.
+    ATTEMPTED_SERVERS.add(server)
+    print('LINE_ATTEMPT_STARTED=' + server, flush=True)
+    print('INITIAL_STATUS=今日签到', flush=True)
+    clear_logcat()
+    button = p.node_by_id(initial_ui, 'txt_accelerate')
+    p.node_tap(button)
+    print('ENTRY_TAPPED_ONCE=' + server, flush=True)
+    entry_time = time.monotonic()
+    seen_countdowns = set()
+    time.sleep(0.5)
+    ui = p.read_ui()
+    image_path = evidence('02-after-entry-' + server, ui)
+    record_countdown(ui, entry_time, seen_countdowns)
+    if success(ui):
+        final = persistent_status_after_attempt(server)[0]
+        if final == 'SIGNED_IN':
+            print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
+            return 0
+        print('RESULT=STOP_SUCCESS_TOAST_NOT_PERSISTENT', flush=True)
+        return 1
+    decision = retry_decision_after_network_error(server, ui, image_path)
+    if decision is not None:
+        return decision
+
+    # Wait at least the full known ad countdown window; never interact with ad content.
+    countdown_deadline = entry_time + 8
+    while time.monotonic() < countdown_deadline:
+        time.sleep(min(1.0, max(0.05, countdown_deadline - time.monotonic())))
+        ui = p.read_ui()
+        record_countdown(ui, entry_time, seen_countdowns)
+        if success(ui):
+            status = persistent_status_after_attempt(server)[0]
+            if status == 'SIGNED_IN':
+                print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
+                return 0
+            print('RESULT=STOP_SUCCESS_TOAST_NOT_PERSISTENT', flush=True)
+            return 1
+        decision = retry_decision_after_network_error(server, ui)
+        if decision is not None:
+            return decision
+
+    unique = {}
+    for _ in range(45):
+        record_countdown(ui, entry_time, seen_countdowns)
+        if success(ui):
+            status = persistent_status_after_attempt(server)[0]
+            if status == 'SIGNED_IN':
+                print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
+                return 0
+            print('RESULT=STOP_SUCCESS_TOAST_NOT_PERSISTENT', flush=True)
+            return 1
+        decision = retry_decision_after_network_error(server, ui)
+        if decision is not None:
+            return decision
+        if countdown_values(ui):
+            time.sleep(1)
+            ui = p.read_ui()
+            record_countdown(ui, entry_time, seen_countdowns)
+            continue
+        unique = find_confirm_target(ui)
+        if len(unique) > 1:
+            evidence('03-final-' + server, ui)
+            print('RESULT=STOP_AMBIGUOUS_CONFIRM_TARGET_NO_CONFIRM_TAP', flush=True)
+            return 1
+        if len(unique) == 1:
+            break
+        time.sleep(1)
+        ui = p.read_ui()
+
+    if len(unique) != 1:
+        image_path = evidence('03-final-' + server, ui)
+        decision = retry_decision_after_network_error(server, ui, image_path)
+        if decision is not None:
+            return decision
+        print('RESULT=STOP_CONFIRM_TARGET_NOT_FOUND_NO_AD_CLICK', flush=True)
+        return 1
+
+    # Re-read before tapping and require the exact same unique control and no countdown.
+    evidence('02b-before-confirm-' + server, ui)
+    expected_bounds = next(iter(unique.keys()))
+    ui = p.read_ui()
+    if countdown_values(ui):
+        record_countdown(ui, entry_time, seen_countdowns)
+        print('RESULT=STOP_COUNTDOWN_REAPPEARED_NO_CONFIRM_TAP', flush=True)
+        return 1
+    candidates = find_confirm_target(ui)
+    if len(candidates) != 1 or next(iter(candidates.keys())) != expected_bounds:
+        print('RESULT=STOP_CONFIRM_TARGET_CHANGED_NO_CONFIRM_TAP', flush=True)
+        return 1
+    print('COUNTDOWN_WAITED_CONFIRM_TARGET=EXACT_TOP_RIGHT', flush=True)
+    p.node_tap(next(iter(candidates.values())))
+    confirm_time = time.monotonic()
+    print('CONFIRM_TAPPED_ONCE=' + server, flush=True)
+
+    time.sleep(max(0.0, 0.4 - (time.monotonic() - confirm_time)))
+    ui = p.read_ui()
+    image_path = evidence('03-immediate-after-confirm-' + server, ui)
+    error_seen = network_io_error(ui, image_path)
+    if error_seen:
+        print('NETWORK_IO_ERROR_DETECTED=YES', flush=True)
+    if success(ui):
+        print('IMMEDIATE_SUCCESS_TEXT=YES', flush=True)
+    else:
+        print('IMMEDIATE_SUCCESS_TEXT=NO', flush=True)
+
+    # Observe the toast window briefly, checking UI, logcat, and private screenshot OCR.
+    for index in range(4):
+        if time.monotonic() - confirm_time >= 2.8:
+            break
+        time.sleep(0.45)
+        ui = p.read_ui()
+        screenshot_path = None
+        if index in (1, 3):
+            screenshot_path = evidence('03b-toast-window-' + server, ui)
+        if network_io_error(ui, screenshot_path):
+            error_seen = True
+            print('NETWORK_IO_ERROR_DETECTED=YES', flush=True)
+        if success(ui):
+            print('TOAST_WINDOW_SUCCESS_TEXT=YES', flush=True)
+
+    # Always verify the persistent personal/account status before deciding whether to rotate.
+    status, _ = persistent_status_after_attempt(server)
+    if status == 'SIGNED_IN':
+        print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
+        return 0
+    if status == 'AVAILABLE' and error_seen:
+        print('NETWORK_IO_RETRY_NEXT_DISTINCT_LINE=' + server, flush=True)
+        return 'RETRY'
+    if status == 'UNREAD':
+        print('RESULT=STOP_PERSISTENT_STATUS_UNREAD', flush=True)
+        return 1
+    if status == 'AVAILABLE':
+        print('RESULT=STOP_UNCONFIRMED_AFTER_SINGLE_CONFIRM_TAP', flush=True)
+        return 1
+    print('RESULT=STOP_PERSISTENT_STATUS_UNKNOWN', flush=True)
+    return 1
 
 
 def main():
     global USERNAME, PASSWORD, AUTHENTICATED
-    USERNAME, PASSWORD = os.environ.get('NCAT_USERNAME', ''), os.environ.get('NCAT_PASSWORD', '')
+    USERNAME = os.environ.get('NCAT_USERNAME', '')
+    PASSWORD = os.environ.get('NCAT_PASSWORD', '')
     if USERNAME != EXPECTED_USER or not PASSWORD:
         print('RESULT=STOP_ACCOUNT_MISMATCH_OR_MISSING_SECRET')
         return 1
+
     p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')
     time.sleep(30)
-    p.tap(648, 1130)
+    p.tap(648, 1130)  # Previously verified "我的" tab on the pinned 720x1280 app build.
     time.sleep(5)
     ui = p.read_ui()
     p.node_tap(p.node_by_id(ui, 'txt_user'))
@@ -121,161 +570,90 @@ def main():
     p.node_tap(p.node_by_id(ui, 'btn_confirm'))
     time.sleep(12)
     ui = p.read_ui()
-    ids = [n.get('resource-id', '') for n in ui.iter()]
-    if any(x.endswith(':id/txt_pwd') for x in ids) or not any(x.endswith(':id/txt_accelerate') for x in ids):
+    ids = [node.get('resource-id', '') for node in ui.iter()]
+    if any(value.endswith(':id/txt_pwd') for value in ids) or not any(value.endswith(':id/txt_accelerate') for value in ids):
         print('RESULT=STOP_LOGIN_NOT_CONFIRMED')
         return 1
-    user = p.node_by_id(ui, 'txt_user').get('text', '')
-    if not user or '尚未登陆' in user or '尚未登录' in user:
+    if not authenticated_account_screen(ui):
         print('RESULT=STOP_LOGIN_NOT_CONFIRMED')
         return 1
     AUTHENTICATED = True
 
-    # Capture only the authenticated account screen; never preserve the credential-entry screen.
+    # First action after login is a read-only status check; already-signed accounts stop here.
     evidence('01-initial', ui)
-    good, already = success(ui)
-    if good or already:
-        print('INITIAL_STATUS=已签到')
-        print('RESULT=ALREADY_CHECKED_IN')
+    initial_status = account_status(ui)
+    if initial_status == 'SIGNED_IN':
+        print('INITIAL_STATUS=已签到', flush=True)
+        print('RESULT=ALREADY_CHECKED_IN', flush=True)
         return 0
-    button = p.node_by_id(ui, 'txt_accelerate')
-    initial = button.get('text', '').strip()
-    if initial != '今日签到':
-        print('INITIAL_STATUS=未知')
-        print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK')
+    if initial_status != 'AVAILABLE':
+        print('INITIAL_STATUS=未知', flush=True)
+        print('RESULT=STOP_INITIAL_STATUS_UNKNOWN_NO_CLICK', flush=True)
         return 1
     print('INITIAL_STATUS=今日签到', flush=True)
 
-    # One entry tap only. Ads are observed/waited out; no ad content is ever tapped.
-    p.node_tap(button)
-    print('ENTRY_TAPPED_ONCE', flush=True)
-    entry_time = time.monotonic()
-    seen_countdowns = set()
-    countdown_deadline = entry_time + 8
-    time.sleep(0.5)
-    ui = p.read_ui()
-    evidence('02-after-entry', ui)
-    record_countdown(ui, entry_time, seen_countdowns)
-    # Observe the full known countdown window without touching any ad content.
-    while time.monotonic() < countdown_deadline:
-        time.sleep(min(1.0, max(0.05, countdown_deadline - time.monotonic())))
-        ui = p.read_ui()
-        record_countdown(ui, entry_time, seen_countdowns)
-    unique = {}
-    for _ in range(30):
-        record_countdown(ui, entry_time, seen_countdowns)
-        unique = {}
-        good, already = success(ui)
-        if good or already:
-            evidence('03-final', ui)
-            print('RESULT=' + ('SIGNIN_SUCCESS' if good else 'ALREADY_CHECKED_IN'))
-            return 0
-        # If a visible countdown remains, keep waiting and never tap.
-        if countdown_values(ui):
-            time.sleep(1)
-            ui = p.read_ui()
-            record_countdown(ui, entry_time, seen_countdowns)
-            continue
-        # Accept only one explicit, enabled “点击签到” control in the expected upper-right area.
-        for n in ui.iter():
-            if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'false') == 'true':
-                c = list(map(int, re.findall(r'\d+', n.get('bounds', ''))))
-                if len(c) == 4 and c[2] > c[0] and c[3] > c[1] and (c[0]+c[2])//2 >= 360 and (c[1]+c[3])//2 <= 425:
-                    unique[tuple(c)] = n
-        if len(unique) > 1:
-            evidence('03-final', ui)
-            print('RESULT=STOP_AMBIGUOUS_CONFIRM_TARGET_NO_CONFIRM_TAP')
+    settings = open_settings_from_account()
+    if settings is None:
+        print('RESULT=STOP_CURRENT_LINE_NOT_READABLE', flush=True)
+        return 1
+    current_server = p.node_by_id(settings, 'txt_line').get('text', '').strip()
+    if current_server not in ALLOWED_SERVERS:
+        print('RESULT=STOP_UNSUPPORTED_CURRENT_LINE', flush=True)
+        return 1
+    print('CURRENT_LINE=' + current_server, flush=True)
+    ui = go_back_to_account()
+    if ui is None:
+        print('RESULT=STOP_ACCOUNT_SCREEN_NOT_REACHED', flush=True)
+        return 1
+
+    for index, server in enumerate(server_order(current_server)):
+        if server in ATTEMPTED_SERVERS:
+            print('RESULT=STOP_DUPLICATE_LINE_BLOCKED', flush=True)
             return 1
-        if len(unique) == 1:
-            break
-        time.sleep(1)
-        ui = p.read_ui()
-    if len(unique) != 1:
-        evidence('03-final', ui)
-        print('RESULT=STOP_CONFIRM_TARGET_NOT_FOUND_NO_AD_CLICK')
-        return 1
-
-    # Save the pre-confirm screen, make exactly one tap, then capture immediately.
-    evidence('02b-before-confirm', ui)
-    expected_bounds = next(iter(unique.keys()))
-    ui = p.read_ui()
-    if countdown_values(ui):
-        record_countdown(ui, entry_time, seen_countdowns)
-        print('RESULT=STOP_COUNTDOWN_REAPPEARED_NO_CONFIRM_TAP')
-        return 1
-    candidates = []
-    for n in ui.iter():
-        if (n.get('text', '').strip() == '点击签到' or n.get('content-desc', '').strip() == '点击签到') and n.get('enabled', 'false') == 'true' and n.get('visible-to-user', 'false') == 'true':
-            c = tuple(map(int, re.findall(r'\d+', n.get('bounds', ''))))
-            if len(c) == 4 and c == expected_bounds:
-                candidates.append(n)
-    if len(candidates) != 1:
-        print('RESULT=STOP_CONFIRM_TARGET_CHANGED_NO_CONFIRM_TAP')
-        return 1
-    print('COUNTDOWN_WAITED_CONFIRM_TARGET=EXACT_TOP_RIGHT', flush=True)
-    p.node_tap(candidates[0])
-    confirm_time = time.monotonic()
-    print('CONFIRM_TAPPED_ONCE', flush=True)
-    time.sleep(max(0.0, 0.8 - (time.monotonic() - confirm_time)))
-    evidence('03-immediate-after-confirm')
-    immediate_ui = None
-    try:
-        immediate_ui = p.read_ui()
-        immediate_good, immediate_already = success(immediate_ui)
-        print('IMMEDIATE_SUCCESS_TEXT=' + ('YES' if immediate_good else 'NO'), flush=True)
-        print('IMMEDIATE_ALREADY_TEXT=' + ('YES' if immediate_already else 'NO'), flush=True)
-    except Exception as exc:
-        print('IMMEDIATE_UI_READ_ERROR=' + type(exc).__name__, flush=True)
-    time.sleep(max(0.0, 1.5 - (time.monotonic() - confirm_time)))
-    evidence('03b-toast-window')
-    try:
-        toast_ui = p.read_ui()
-        toast_good, toast_already = success(toast_ui)
-        print('TOAST_WINDOW_SUCCESS_TEXT=' + ('YES' if toast_good else 'NO'), flush=True)
-        print('TOAST_WINDOW_ALREADY_TEXT=' + ('YES' if toast_already else 'NO'), flush=True)
-    except Exception as exc:
-        print('TOAST_WINDOW_UI_READ_ERROR=' + type(exc).__name__, flush=True)
-
-    # Verify persistent status on the personal/account screen after the toast window.
-    time.sleep(0.75)
-    ui = p.read_ui()
-    if not account_screen(ui):
-        p.adb('shell', 'input', 'keyevent', '4')
-        time.sleep(1)
-        ui = p.read_ui()
-    if not account_screen(ui):
-        my_tabs = [n for n in ui.iter() if n.get('text', '').strip() == '我的' or n.get('content-desc', '').strip() == '我的']
-        if len(my_tabs) == 1:
-            p.node_tap(my_tabs[0])
-            time.sleep(2)
-            ui = p.read_ui()
+        if index == 0:
+            line_ui = ui
         else:
-            evidence('04-persistent-account-status', ui)
-            print('PERSISTENT_STATUS=NOT_READ_PERSONAL_TAB_NOT_UNIQUE', flush=True)
-            print('RESULT=STOP_PERSISTENT_STATUS_UNREAD', flush=True)
+            switch_result, line_ui = switch_server(server)
+            if switch_result == 'NETWORK_IO':
+                # No check-in tap occurred on this line; move on once, then read status there.
+                print('NETWORK_IO_DURING_LINE_SWITCH=' + server, flush=True)
+                ui = read_authenticated_account_screen()
+                if ui is None:
+                    print('RESULT=STOP_ACCOUNT_SCREEN_NOT_REACHED_AFTER_LINE_ERROR', flush=True)
+                    return 1
+                continue
+            if switch_result != 'OK' or line_ui is None:
+                print('RESULT=STOP_LINE_SWITCH_UNVERIFIED', flush=True)
+                return 1
+            ui = line_ui
+
+        # Read-only status is checked on each distinct line before any sign-in tap.
+        status = account_status(line_ui)
+        if status == 'SIGNED_IN':
+            evidence('04-already-signed-' + server, line_ui)
+            print('PERSISTENT_STATUS=已签到', flush=True)
+            print('RESULT=ALREADY_CHECKED_IN', flush=True)
+            return 0
+        if status != 'AVAILABLE':
+            if network_io_error(line_ui):
+                print('NETWORK_IO_BEFORE_TAP=' + server, flush=True)
+                continue
+            print('RESULT=STOP_LINE_STATUS_NOT_READABLE', flush=True)
             return 1
-    time.sleep(2)
-    ui = p.read_ui()
-    evidence('04-persistent-account-status', ui)
-    if not account_screen(ui):
-        print('PERSISTENT_STATUS=NOT_READ_ACCOUNT_SCREEN_NOT_REACHED', flush=True)
-        print('RESULT=STOP_PERSISTENT_STATUS_UNREAD', flush=True)
+        print('READ_ONLY_PRECHECK=' + server + ':今日签到', flush=True)
+        result = attempt_on_server(server, line_ui)
+        if result == 0:
+            return 0
+        if result == 'RETRY':
+            ui = read_authenticated_account_screen()
+            if ui is None:
+                print('RESULT=STOP_ACCOUNT_SCREEN_NOT_REACHED_AFTER_NETWORK_IO', flush=True)
+                return 1
+            continue
         return 1
-    user = p.node_by_id(ui, 'txt_user').get('text', '')
-    if not user or '尚未登陆' in user or '尚未登录' in user:
-        print('PERSISTENT_STATUS=UNKNOWN_AUTH_NOT_CONFIRMED', flush=True)
-        print('RESULT=STOP_PERSISTENT_STATUS_UNREAD', flush=True)
-        return 1
-    status_button = p.node_by_id(ui, 'txt_accelerate').get('text', '').strip()
-    if '已签到' in status_button:
-        print('PERSISTENT_STATUS=已签到', flush=True)
-        print('RESULT=SIGNIN_SUCCESS_PERSISTENT', flush=True)
-        return 0
-    if status_button == '今日签到':
-        print('PERSISTENT_STATUS=今日签到', flush=True)
-    else:
-        print('PERSISTENT_STATUS=UNKNOWN', flush=True)
-    print('RESULT=STOP_UNCONFIRMED_AFTER_SINGLE_CONFIRM_TAP', flush=True)
+
+    print('RESULT=STOP_ALL_LINES_EXHAUSTED_NETWORK_IO', flush=True)
+    print('PERSISTENT_STATUS=未确认', flush=True)
     return 1
 
 
@@ -286,7 +664,6 @@ if __name__ == '__main__':
         print('RESULT=STOP_ERROR_' + type(exc).__name__)
         if isinstance(exc, RuntimeError):
             print('REASON=' + scrub(str(exc)))
-        # Never capture the credential-entry screen on an early failure.
         if AUTHENTICATED:
             evidence('99-error')
         sys.exit(1)

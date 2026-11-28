@@ -20,7 +20,7 @@ jobs:
             sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
           fi
           sudo apt-get update -qq
-          sudo apt-get install -y adb
+          sudo apt-get install -y adb tesseract-ocr tesseract-ocr-chi-sim
           docker run -d --rm --privileged --name ncat-controlled -p 127.0.0.1:5555:5555 redroid/redroid@sha256:52332b2d74f337982d5ac281a8020ec297fb1ea05cbdcdaaa9c19a2065ae1adc androidboot.use_memfd=1 androidboot.redroid_gpu_mode=guest
           for n in $(seq 1 90); do
             adb connect 127.0.0.1:5555 >/dev/null 2>&1 || true
@@ -32,15 +32,20 @@ jobs:
           curl -fL --retry 2 --max-time 120 -sS -o /tmp/ncat.apk 'https://dl.ncat33.com/target/apk/ncat/202611/26/app/c200000-NcatC200000V261126030029-3.5.1.30501_release.apk'
           echo '1de44b3d42f60120d46e621968239c869995c659f2baf6bfb83b3d60539b28a3  /tmp/ncat.apk' | sha256sum -c -
           adb -s 127.0.0.1:5555 install /tmp/ncat.apk
-      - name: Attempt at most one controlled check-in
+      - name: Attempt at most one controlled check-in per line
         env:
           NCAT_USERNAME: ${{ secrets.NCAT_USERNAME }}
           NCAT_PASSWORD: ${{ secrets.NCAT_PASSWORD }}
           EVIDENCE_DIR: checkin-evidence
         run: |
           set +e
-          python3 scripts/checkin-evidence.py 2>&1 | tee checkin-evidence/run.log
-          result=${PIPESTATUS[0]}
+          python3 scripts/checkin-evidence.py > checkin-evidence/run.log 2>&1
+          result=$?
+          final=$(grep '^RESULT=' checkin-evidence/run.log | tail -n 1 | cut -d= -f2-)
+          if [[ ! "$final" =~ ^(ALREADY_CHECKED_IN|SIGNIN_SUCCESS_PERSISTENT|STOP_[A-Za-z0-9_-]+)$ ]]; then
+            final=STOP_NO_SAFE_RESULT
+          fi
+          echo "CHECKIN_RESULT=$final"
           exit "$result"
       - name: Encrypt evidence before upload
         if: always()
