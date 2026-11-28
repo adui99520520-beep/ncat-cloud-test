@@ -10,7 +10,7 @@ spec = importlib.util.spec_from_file_location('probe', 'scripts/login-probe.py')
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 
-EXPECTED_USER = 'adui99520520@bot.cue.im'
+EXPECTED_USER = os.environ.get('NCAT_USERNAME', '')
 
 def texts(root):
     return [v for n in root.iter() for v in (n.get('text', ''), n.get('content-desc', '')) if v]
@@ -21,7 +21,7 @@ def success(root):
 
 def main():
     username, password = os.environ.get('NCAT_USERNAME', ''), os.environ.get('NCAT_PASSWORD', '')
-    if username != EXPECTED_USER or not password:
+    if username != EXPECTED_USER or not username.casefold().endswith('@bot.cue.im') or not password:
         print('RESULT=STOP_ACCOUNT_MISMATCH_OR_MISSING_SECRET')
         return 1
     p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')

@@ -3,6 +3,7 @@
 import importlib.util
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -17,12 +18,22 @@ spec = importlib.util.spec_from_file_location('probe', 'scripts/login-probe.py')
 p = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(p)
 
-EXPECTED_USER = 'adui99520520@bot.cue.im'
+EXPECTED_USER = os.environ.get('NCAT_USERNAME', '')
 ALLOWED_SERVERS = ('精品1', '精品2', '精品3', '优化1', '精品5')
 APP_UI_READY_TIMEOUT = 90
 APP_UI_POLL_INTERVAL = 2
 APP_UI_STARTUP_DELAY = 30
 APP_UI_COMMAND_TIMEOUT = 45
+SERVER_PICKER_SCREEN_SIZE = (720, 1280)
+SERVER_PICKER_CLOSE_POINT = (649, 560)
+SERVER_PICKER_TITLE_REGION = (240, 520, 500, 610)
+SERVER_PICKER_TITLE_SHA256 = 'bf3aeb791e4c5554a2fea0b40e287cb651cf74c2ee59c1588b1775cc2b1cc83e'
+SERVER_PICKER_BLOCKED_LINE_SHA256 = frozenset((
+    'bb015c60bafc8a96801eb9ae7d19b76f52d869ea143ec54d6060fcafe6710cd6',
+    '7926aa2f17ad546856b7fbf5a716d8f68853b87bf508d1ea2f793431169086f2',
+    '78641f96bc729820e7bef828389ad89da51205ed7ee48ab6c33155ab8249a37b',
+    'e54154cc0a4e97e99609fad08e18f6b463e7c530d836baef6d67c1ec11ddde59',
+))
 # Prefer the last known working line, but start with the app's current line and
 # visit every other supported line at most once.
 PREFERRED_SERVERS = ('精品3', '精品1', '精品2', '优化1', '精品5')
@@ -318,6 +329,7 @@ def wait_for_account_ui(timeout=APP_UI_READY_TIMEOUT):
 def start_app_and_wait_for_account_ui():
     p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')
     time.sleep(APP_UI_STARTUP_DELAY)
+    dismiss_startup_server_picker()
     return wait_for_account_ui()
 
 
@@ -350,6 +362,80 @@ def capture_private_screenshot(label):
         print('EVIDENCE_SCREENSHOT_ERROR=' + type(exc).__name__, flush=True)
         image_path = None
     return image_path
+
+
+def known_startup_server_picker(image_path):
+    """Recognize only the known startup picker; keep OCR text private and in memory."""
+    if not image_path or not Path(image_path).is_file():
+        return False
+    try:
+        image = Path(image_path).read_bytes()
+        if not image.startswith(b'\x89PNG\r\n\x1a\n') or len(image) < 24:
+            return False
+        if struct.unpack('>II', image[16:24]) != SERVER_PICKER_SCREEN_SIZE:
+            return False
+        import csv
+        import hashlib
+        import io
+        result = subprocess.run(
+            ['tesseract', str(image_path), 'stdout', '-l', 'chi_sim+eng', '--psm', '11', 'tsv'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+        groups = {}
+        rows = csv.DictReader(io.StringIO(result.stdout.decode('utf-8', errors='ignore')), delimiter='\t')
+        for row in rows:
+            text = compact_text(row.get('text', ''))
+            if not text:
+                continue
+            try:
+                key = tuple(row[name] for name in ('page_num', 'block_num', 'par_num', 'line_num'))
+                left, top = int(row['left']), int(row['top'])
+                right, bottom = left + int(row['width']), top + int(row['height'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            groups.setdefault(key, []).append((text, left, top, right, bottom))
+
+        title_left, title_top, title_right, title_bottom = SERVER_PICKER_TITLE_REGION
+        title_found = False
+        for items in groups.values():
+            line_text = ''.join(item[0] for item in items)
+            digest = hashlib.sha256(line_text.encode('utf-8')).hexdigest()
+            if digest in SERVER_PICKER_BLOCKED_LINE_SHA256:
+                return False
+            if digest != SERVER_PICKER_TITLE_SHA256:
+                continue
+            left = min(item[1] for item in items)
+            top = min(item[2] for item in items)
+            right = max(item[3] for item in items)
+            bottom = max(item[4] for item in items)
+            if not (
+                left >= title_left and top >= title_top
+                and right <= title_right and bottom <= title_bottom
+            ) or title_found:
+                return False
+            title_found = True
+        return title_found
+    except (OSError, subprocess.SubprocessError, struct.error, csv.Error):
+        return False
+
+
+def dismiss_startup_server_picker():
+    """Dismiss only the OCR-confirmed picker via its known X; never choose a route."""
+    image_path = capture_private_screenshot('00-startup-screen')
+    if not known_startup_server_picker(image_path):
+        return False
+    x, y = SERVER_PICKER_CLOSE_POINT
+    try:
+        p.adb('shell', 'input', 'tap', str(x), str(y))
+    except Exception:
+        print('STARTUP_DIALOG_DISMISS=FAILED', flush=True)
+        return False
+    time.sleep(1.5)
+    print('STARTUP_DIALOG_DISMISS=YES', flush=True)
+    return True
 
 
 def evidence(label, root=None):
@@ -878,7 +964,7 @@ def main():
     SUMMARY_MODE = raw_mode
     USERNAME = os.environ.get('NCAT_USERNAME', '')
     PASSWORD = os.environ.get('NCAT_PASSWORD', '')
-    if USERNAME != EXPECTED_USER or not PASSWORD:
+    if USERNAME != EXPECTED_USER or not USERNAME.casefold().endswith('@bot.cue.im') or not PASSWORD:
         SUMMARY_RESULT_CODE = 'STOP_ACCOUNT_CONFIG'
         print('RESULT=STOP_ACCOUNT_MISMATCH_OR_MISSING_SECRET')
         return 1

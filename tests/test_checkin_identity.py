@@ -9,6 +9,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest.mock import patch
 from xml.sax.saxutils import escape
+import hashlib
+import struct
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +21,7 @@ os.environ['EVIDENCE_DIR'] = _EVIDENCE_TMP.name
 _spec = importlib.util.spec_from_file_location('checkin_evidence_under_test', REPO_ROOT / 'scripts/checkin-evidence.py')
 checkin = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(checkin)
+checkin.EXPECTED_USER = 'synthetic-bot@bot.cue.im'
 probe = checkin.p
 
 
@@ -79,6 +83,7 @@ class CheckinIdentityTests(unittest.TestCase):
              patch.object(probe, 'adb') as adb, \
              patch.object(probe, 'node_tap') as tap, \
              patch.object(checkin, 'wait_for_account_ui', return_value=(ui, state)) as wait_ui, \
+             patch.object(checkin, 'dismiss_startup_server_picker', return_value=False), \
              patch.object(checkin, 'open_settings_from_account') as settings, \
              patch.object(checkin, 'evidence') as evidence, \
              patch.object(checkin, 'capture_private_screenshot') as private_screenshot, \
@@ -434,12 +439,13 @@ class CheckinIdentityTests(unittest.TestCase):
 
         with patch.object(probe, 'adb', side_effect=adb), \
              patch.object(checkin.time, 'sleep', side_effect=sleep), \
+             patch.object(checkin, 'dismiss_startup_server_picker', side_effect=lambda: events.append('dismiss')), \
              patch.object(checkin, 'wait_for_account_ui', side_effect=wait):
             ui, state = checkin.start_app_and_wait_for_account_ui()
 
         self.assertIsNone(ui)
         self.assertEqual(state, 'UNKNOWN')
-        self.assertEqual(events, ['launch', ('sleep', checkin.APP_UI_STARTUP_DELAY), 'read'])
+        self.assertEqual(events, ['launch', ('sleep', checkin.APP_UI_STARTUP_DELAY), 'dismiss', 'read'])
         self.assertEqual(checkin.APP_UI_STARTUP_DELAY, 30)
 
     def test_ui_readiness_retries_with_bounded_read_timeout(self):
@@ -465,6 +471,87 @@ class CheckinIdentityTests(unittest.TestCase):
         self.assertIsNone(ui)
         self.assertEqual(state, 'UNKNOWN')
         read_ui_mock.assert_not_called()
+
+    def test_server_picker_ocr_is_hash_and_resolution_gated(self):
+        image_path = Path(_EVIDENCE_TMP.name) / 'synthetic-server-picker.png'
+        header = 'synthetic-modal-header'
+        blocked = 'synthetic-blocked-header'
+        columns = 'level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext'
+
+        def write_png(size):
+            data = bytearray(24)
+            data[:8] = b'\x89PNG\r\n\x1a\n'
+            data[16:24] = struct.pack('>II', *size)
+            image_path.write_bytes(data)
+            return image_path
+
+        def tsv_row(text, block, left=266, top=543):
+            return f'5\t1\t{block}\t1\t1\t1\t{left}\t{top}\t193\t43\t99\t{text}'
+
+        def tsv_output(*rows):
+            return (columns + '\n' + '\n'.join(rows) + '\n').encode('utf-8')
+
+        title_hash = hashlib.sha256(header.encode('utf-8')).hexdigest()
+        blocked_hash = hashlib.sha256(blocked.encode('utf-8')).hexdigest()
+        write_png(checkin.SERVER_PICKER_SCREEN_SIZE)
+        with patch.object(checkin, 'SERVER_PICKER_TITLE_SHA256', title_hash), \
+             patch.object(checkin, 'SERVER_PICKER_BLOCKED_LINE_SHA256', frozenset((blocked_hash,))), \
+             patch.object(checkin.subprocess, 'run', return_value=SimpleNamespace(stdout=tsv_output(tsv_row(header, 1)))) as ocr:
+            self.assertTrue(checkin.known_startup_server_picker(image_path))
+            ocr.assert_called_once()
+
+        with patch.object(checkin, 'SERVER_PICKER_TITLE_SHA256', title_hash), \
+             patch.object(checkin, 'SERVER_PICKER_BLOCKED_LINE_SHA256', frozenset((blocked_hash,))), \
+             patch.object(checkin.subprocess, 'run', return_value=SimpleNamespace(stdout=tsv_output(tsv_row(header, 1), tsv_row(blocked, 2, 10, 10)))):
+            self.assertFalse(checkin.known_startup_server_picker(image_path))
+
+        with patch.object(checkin, 'SERVER_PICKER_TITLE_SHA256', title_hash), \
+             patch.object(checkin, 'SERVER_PICKER_BLOCKED_LINE_SHA256', frozenset((blocked_hash,))), \
+             patch.object(checkin.subprocess, 'run', return_value=SimpleNamespace(stdout=tsv_output(tsv_row(header, 1, 266, 700)))):
+            self.assertFalse(checkin.known_startup_server_picker(image_path))
+
+        write_png((720, 1180))
+        with patch.object(checkin.subprocess, 'run') as ocr:
+            self.assertFalse(checkin.known_startup_server_picker(image_path))
+            ocr.assert_not_called()
+
+    def test_server_picker_close_requires_recognition_and_targets_only_x(self):
+        image_path = Path(_EVIDENCE_TMP.name) / 'synthetic-dismiss.png'
+        image_path.write_bytes(b'private-test-image')
+        with patch.object(checkin, 'capture_private_screenshot', return_value=image_path), \
+             patch.object(checkin, 'known_startup_server_picker', return_value=False), \
+             patch.object(probe, 'adb') as adb:
+            self.assertFalse(checkin.dismiss_startup_server_picker())
+            adb.assert_not_called()
+
+        with patch.object(checkin, 'capture_private_screenshot', return_value=image_path), \
+             patch.object(checkin, 'known_startup_server_picker', return_value=True), \
+             patch.object(probe, 'adb') as adb, \
+             patch.object(checkin.time, 'sleep'), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(checkin.dismiss_startup_server_picker())
+        adb.assert_called_once_with('shell', 'input', 'tap', '649', '560')
+
+    def test_config_rejects_non_bot_domain_even_when_runtime_identity_matches(self):
+        summary = Path(_EVIDENCE_TMP.name) / 'non-bot-account-summary.txt'
+        summary.write_text('', encoding='utf-8')
+        env = {
+            'NCAT_USERNAME': 'owner@example.invalid',
+            'NCAT_PASSWORD': 'mock-only-not-a-real-secret',
+            'CHECKIN_MODE': 'verify',
+            'GITHUB_STEP_SUMMARY': str(summary),
+        }
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(checkin, 'EXPECTED_USER', 'owner@example.invalid'), \
+             patch.object(checkin, 'start_app_and_wait_for_account_ui') as start_app, \
+             patch.object(probe, 'adb') as adb, \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = checkin.run()
+
+        self.assertEqual(result, 1)
+        start_app.assert_not_called()
+        adb.assert_not_called()
+        self.assertIn('result_code=STOP_ACCOUNT_CONFIG', summary.read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':
