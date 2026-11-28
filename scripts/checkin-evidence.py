@@ -21,7 +21,8 @@ EXPECTED_USER = 'adui99520520@bot.cue.im'
 ALLOWED_SERVERS = ('精品1', '精品2', '精品3', '优化1', '精品5')
 APP_UI_READY_TIMEOUT = 90
 APP_UI_POLL_INTERVAL = 2
-APP_UI_COMMAND_TIMEOUT = 30
+APP_UI_STARTUP_DELAY = 30
+APP_UI_COMMAND_TIMEOUT = 45
 # Prefer the last known working line, but start with the app's current line and
 # visit every other supported line at most once.
 PREFERRED_SERVERS = ('精品3', '精品1', '精品2', '优化1', '精品5')
@@ -314,6 +315,12 @@ def wait_for_account_ui(timeout=APP_UI_READY_TIMEOUT):
     return None, 'UNKNOWN'
 
 
+def start_app_and_wait_for_account_ui():
+    p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')
+    time.sleep(APP_UI_STARTUP_DELAY)
+    return wait_for_account_ui()
+
+
 def exact_text_nodes(root, value):
     return [node for node in root.iter() if node.get('text', '').strip() == value or node.get('content-desc', '').strip() == value]
 
@@ -334,14 +341,20 @@ def tap_unique_text(root, value):
     return True
 
 
-def evidence(label, root=None):
-    """Save only to the private run directory; the workflow encrypts it before upload."""
+def capture_private_screenshot(label):
+    """Save only a screenshot to the private run directory; the workflow encrypts it."""
     image_path = BASE / (label + '.png')
     try:
         image_path.write_bytes(p.adb('exec-out', 'screencap', '-p', capture=True))
     except Exception as exc:
         print('EVIDENCE_SCREENSHOT_ERROR=' + type(exc).__name__, flush=True)
         image_path = None
+    return image_path
+
+
+def evidence(label, root=None):
+    """Save UI evidence only to the private run directory; encrypt it before upload."""
+    image_path = capture_private_screenshot(label)
     if root is None:
         try:
             root = p.read_ui()
@@ -870,8 +883,7 @@ def main():
         print('RESULT=STOP_ACCOUNT_MISMATCH_OR_MISSING_SECRET')
         return 1
 
-    p.adb('shell', 'am', 'start', '-n', p.PKG + '/com.salmon.film.main.ui.SplashActivity')
-    ui, state = wait_for_account_ui()
+    ui, state = start_app_and_wait_for_account_ui()
     if state in ('LOGIN_FORM', 'LOGGED_OUT'):
         ui, state = login_expected_account(ui, state)
         if ui is None:
@@ -884,6 +896,8 @@ def main():
             SUMMARY_RESULT_CODE = 'STOP_IDENTITY_UNVERIFIED'
             print('RESULT=STOP_ACCOUNT_IDENTITY_UNVERIFIED_NO_CHECKIN')
         else:
+            if state == 'UNKNOWN':
+                capture_private_screenshot('00-app-ui-unknown')
             SUMMARY_RESULT_CODE = 'STOP_APP_UI_UNKNOWN'
             print('RESULT=STOP_APP_UI_UNKNOWN_NO_CHECKIN')
         return 1

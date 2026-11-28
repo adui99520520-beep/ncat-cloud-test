@@ -80,7 +80,9 @@ class CheckinIdentityTests(unittest.TestCase):
              patch.object(probe, 'node_tap') as tap, \
              patch.object(checkin, 'wait_for_account_ui', return_value=(ui, state)) as wait_ui, \
              patch.object(checkin, 'open_settings_from_account') as settings, \
-             patch.object(checkin, 'evidence') as evidence:
+             patch.object(checkin, 'evidence') as evidence, \
+             patch.object(checkin, 'capture_private_screenshot') as private_screenshot, \
+             patch.object(checkin.time, 'sleep'):
             with contextlib.redirect_stdout(io.StringIO()):
                 result = checkin.run()
             calls = {
@@ -89,6 +91,7 @@ class CheckinIdentityTests(unittest.TestCase):
                 'wait': wait_ui.call_count,
                 'settings': settings.call_count,
                 'evidence': evidence.call_count,
+                'private_screenshot': private_screenshot.call_count,
             }
         return result, summary.read_text(encoding='utf-8').splitlines(), calls
 
@@ -272,6 +275,7 @@ class CheckinIdentityTests(unittest.TestCase):
                 self.assertEqual(summary[4], 'entry_click_attempted=no')
                 self.assertEqual(summary[5], 'confirmation_click_attempted=no')
                 self.assertEqual(summary[6], 'result_code=' + result_code)
+                self.assertEqual(calls['private_screenshot'], 1 if state == 'UNKNOWN' else 0)
 
     def test_verify_mode_unknown_current_day_status_stops_without_click(self):
         expected = account_page(checkin.EXPECTED_USER, status='Loading')
@@ -415,6 +419,29 @@ class CheckinIdentityTests(unittest.TestCase):
         self.assertFalse(checkin.record_route_attempt('another-unlisted-route'))
         self.assertLessEqual(len(checkin.SUMMARY_ATTEMPTED_ROUTES), 5)
 
+    def test_app_start_waits_for_stability_before_ui_read(self):
+        events = []
+
+        def adb(*args, **kwargs):
+            events.append('launch')
+
+        def sleep(seconds):
+            events.append(('sleep', seconds))
+
+        def wait():
+            events.append('read')
+            return None, 'UNKNOWN'
+
+        with patch.object(probe, 'adb', side_effect=adb), \
+             patch.object(checkin.time, 'sleep', side_effect=sleep), \
+             patch.object(checkin, 'wait_for_account_ui', side_effect=wait):
+            ui, state = checkin.start_app_and_wait_for_account_ui()
+
+        self.assertIsNone(ui)
+        self.assertEqual(state, 'UNKNOWN')
+        self.assertEqual(events, ['launch', ('sleep', checkin.APP_UI_STARTUP_DELAY), 'read'])
+        self.assertEqual(checkin.APP_UI_STARTUP_DELAY, 30)
+
     def test_ui_readiness_retries_with_bounded_read_timeout(self):
         unknown = ET.fromstring('<hierarchy><node text="Loading"/></hierarchy>')
         login = login_page()
@@ -431,6 +458,7 @@ class CheckinIdentityTests(unittest.TestCase):
         self.assertEqual(state, 'LOGIN_FORM')
         self.assertTrue(timeouts and all(0 < timeout <= checkin.APP_UI_COMMAND_TIMEOUT for timeout in timeouts))
         self.assertGreater(max(timeouts), 5)
+        self.assertEqual(checkin.APP_UI_COMMAND_TIMEOUT, 45)
 
         with patch.object(probe, 'read_ui') as read_ui_mock:
             ui, state = checkin.wait_for_account_ui(timeout=0)
