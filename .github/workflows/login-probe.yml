@@ -3,13 +3,12 @@ on:
   workflow_dispatch:
     inputs:
       action:
-        description: Check existing status without clicking, or perform one check-in click
+        description: Read-only verification only
         required: true
         default: verify
         type: choice
         options:
           - verify
-          - click
 permissions:
   contents: read
 jobs:
@@ -40,11 +39,7 @@ jobs:
           curl -fL --retry 2 --max-time 120 -sS -o /tmp/ncat.apk 'https://dl.ncat33.com/target/apk/ncat/202611/26/app/c200000-NcatC200000V261126030029-3.5.1.30501_release.apk'
           echo '1de44b3d42f60120d46e621968239c869995c659f2baf6bfb83b3d60539b28a3  /tmp/ncat.apk' | sha256sum -c -
           adb -s 127.0.0.1:5555 install /tmp/ncat.apk
-      - name: Test login without publishing account data
-        env:
-          NCAT_USERNAME: ${{ secrets.NCAT_USERNAME }}
-          NCAT_PASSWORD: ${{ secrets.NCAT_PASSWORD }}
-          CHECKIN_ACTION: ${{ inputs.action }}
+      - name: Read account state without signing in or checking in
         run: python3 scripts/login-probe.py
       - name: Delete disposable Android container
         if: always()
